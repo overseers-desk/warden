@@ -27,33 +27,33 @@ A folder at the top of the file path can still have `parent_shared_folder_id` po
 
 The Web UI message "within multiple shared folders" refers to sharing-graph nesting, not path-tree nesting. It is misleading on a top-level folder.
 
-## Deleting a shared folder leaves an inactive record
+## A deleted shared folder's record persists without a path
 
-Deleting a shared folder does not remove its sharing record. The folder becomes inactive: `/2/sharing/list_folders` entries with empty `path_display` are inactive shared folders, and their sfids persist indefinitely. Public shared links issued before deletion stay LIVE and reachable by anyone holding the URL.
+Deleting a shared folder does not remove its sharing record. `/2/sharing/list_folders` returns the record with empty `path_display`, its sfid persists indefinitely, and public shared links issued before deletion stay LIVE and reachable by anyone holding the URL.
 
-To enumerate the account's inactive shared folders: paginate `/2/sharing/list_folders` and filter for empty `path_display`.
+To enumerate the account's no-path shared folders: paginate `/2/sharing/list_folders` and filter for empty `path_display`.
 
 ## Child shared folders block parent unshare
 
-Both active and inactive shared folders block their parent's unshare. If any shared folder has `parent_shared_folder_id == X`, then `X` cannot be unshared until that child is itself unshared, recursively. The API surfaces this as nested `no_permission`; the Web UI says "within multiple shared folders". In `list_folders` output, active children have non-empty `path_display`; inactive children have empty `path_display`. Both must be cleared.
+Both kinds of shared folder, with a path and without, block their parent's unshare. If any shared folder has `parent_shared_folder_id == X`, then `X` cannot be unshared until that child is itself unshared, recursively. The API surfaces this as nested `no_permission`; the Web UI says "within multiple shared folders". In `list_folders` output, children with a path show non-empty `path_display`; children without a path show it empty. Both must be cleared.
 
-## list_folders omits parent_shared_folder_id for some active entries
+## list_folders omits parent_shared_folder_id for some entries that have a path
 
-Do not trust `list_folders` as the authoritative source for `parent_shared_folder_id`. The field is documented as optional and is reliably present on inactive entries, but on active nested shared folders it is sometimes returned and sometimes silently omitted, even though `/2/sharing/get_folder_metadata` on the same sfid reports it consistently.
+Do not trust `list_folders` as the authoritative source for `parent_shared_folder_id`. The field is documented as optional and is reliably present on entries without a path, but on nested shared folders that have a path it is sometimes returned and sometimes silently omitted, even though `/2/sharing/get_folder_metadata` on the same sfid reports it consistently.
 
 The reliable enumeration of children of `parent_sfid` therefore is: list_folders to get all sfids, and for any entry that does not include `parent_shared_folder_id`, re-query that sfid via `get_folder_metadata`. The `dbx_list_children` helper in this codebase does that.
 
-## mount_folder on an inactive child drops its parent_shared_folder_id
+## mount_folder on a no-path child drops its parent_shared_folder_id
 
-When `/2/sharing/mount_folder` is called on an inactive shared folder that previously had `parent_shared_folder_id == X`, the resulting active folder has the parent field absent in `get_folder_metadata` output. This is the mechanism that makes the recursive unshare recipe work: the freshly-mounted folder is no longer a "child shared folder" in Dropbox's eyes, so it can be unshared on its own without breaking the parent shared folder's rules. After the child is unshared, the parent loses one obstruction.
+When `/2/sharing/mount_folder` is called on a shared folder without a path that previously had `parent_shared_folder_id == X`, the resulting folder (now with a path) has the parent field absent in `get_folder_metadata` output. This is the mechanism that makes the recursive unshare recipe work: the freshly-mounted folder is no longer a "child shared folder" in Dropbox's eyes, so it can be unshared on its own without breaking the parent shared folder's rules. After the child is unshared, the parent loses one obstruction.
 
-## Active nested children: move-to-top to sever inheritance
+## Nested children with a path: move-to-top to sever inheritance
 
-For an active shared folder where `parent_shared_folder_id` is set, `/2/sharing/unshare_folder` fails with `no_permission` on a Basic plan. `set_access_inheritance no_inherit` would clear the inheritance, but it is team-only.
+For a shared folder with a path where `parent_shared_folder_id` is set, `/2/sharing/unshare_folder` fails with `no_permission` on a Basic plan. `set_access_inheritance no_inherit` would clear the inheritance, but it is team-only.
 
 The escape hatch is `/2/files/move_v2`. Moving the nested shared folder to a destination outside any shared-folder ancestry (top-level is the simple choice) clears `parent_shared_folder_id` in `get_folder_metadata` output. After the move, `unshare_folder` accepts the call. Dropbox's own help page confirms this: "If a subfolder is moved from a shared folder, the Unshare button will become available."
 
-This works on Basic accounts. The two writes that achieve the same effect (mount-from-inactive and move-from-nested) are interchangeable mechanisms for the underlying state change: clearing `parent_shared_folder_id`.
+This works on Basic accounts. The two writes that achieve the same effect (mount-from-no-path and move-from-nested) are interchangeable mechanisms for the underlying state change: clearing `parent_shared_folder_id`.
 
 ## Greedy sunset: pair every move-out with a move-back
 
@@ -72,10 +72,10 @@ try_unshare_sfid(sfid):
     try unshare_folder(sfid)
     if success: return 1
     if failure tag is no_permission:
-        kids = list_children(sfid)               # active + inactive
+        kids = list_children(sfid)               # with-path + no-path
         if kids:
             for each kid:
-                if kid is inactive: mount_folder(kid)
+                if kid has no path: mount_folder(kid)
                 try_unshare_sfid(kid)            # recurse
             retry unshare_folder(sfid)
             if success: return 1
@@ -87,7 +87,7 @@ try_unshare_sfid(sfid):
     return 0
 ```
 
-The recursion bottoms out at leaf shared folders with no children, no parent inheritance, or both. Inactive children that get mounted become regular folders at a Dropbox-chosen path (often top-level); the recursion does not move them back, because their original location no longer existed. Active children that got moved out are restored by their own frame's move-back.
+The recursion bottoms out at leaf shared folders with no children, no parent inheritance, or both. No-path children that get mounted become regular folders at a Dropbox-chosen path (often top-level); the recursion does not move them back, because their original location no longer existed. Children that already had a path and got moved out are restored by their own frame's move-back.
 
 ## set_access_inheritance is gated to team accounts
 
@@ -105,7 +105,7 @@ For shared folders where the caller's access is inherited from a parent, `/2/sha
 
 When `/2/files/list_folder` is called with `recursive=true`, the queried path itself is one of the entries returned (as the first entry). Filter by `path_lower` equality with the root before treating entries as descendants.
 
-# Story: 2026-05-09, /2023-05 Signed unshare blocked by inactive child sfid 4087858721
+# Story: 2026-05-09, /2023-05 Signed unshare blocked by no-path child sfid 4087858721
 
 ## Setting out
 
@@ -119,27 +119,27 @@ The script reported "Done" on first run because it treated the HTTP 200 from `/2
 
 The Web UI's "within multiple shared folders" was attached to a path-tree-nesting hypothesis without reading the path. /2023-05 Signed has one slash; it is a top-level folder, so the path-nesting story was disproven by the string itself.
 
-The `/2/sharing/list_folder_members` result for the inactive child sfid showed only one member with a personal Gmail address and `is_inherited: true`. Without checking, that was treated as a different person from the rclone token's owner. `/2/users/get_current_account` showed they were the same account; `list_folder_members` simply omits the inheriting caller in some cases.
+The `/2/sharing/list_folder_members` result for the no-path child sfid showed only one member with a personal Gmail address and `is_inherited: true`. Without checking, that was treated as a different person from the rclone token's owner. `/2/users/get_current_account` showed they were the same account; `list_folder_members` simply omits the inheriting caller in some cases.
 
 The polling parser was reading only the outer `JobStatus.failed.tag` (`unshare_folder_error`) and missing the deeper nested reason (`no_permission`).
 
 ## What was actually wrong
 
-A subfolder of /2023-05 Signed had once been a shared folder of its own (sfid 4087858721, name "10-05-2023") and had been deleted some time ago. When deleted, the file-tree entry was removed from the visible tree; the sharing record was not. `/2/sharing/list_folders` surfaced it with empty `path_display`, alongside 35 other inactive shared folders accumulated through the account's history. `/2/sharing/get_folder_metadata` on sfid 4087858721 returned `parent_shared_folder_id=4033641409`, the same id as /2023-05 Signed. So in Dropbox's sharing graph, /2023-05 Signed had a child shared folder and was therefore not unshareable, even though the file-tree showed it as a leaf top-level folder.
+A subfolder of /2023-05 Signed had once been a shared folder of its own (sfid 4087858721, name "10-05-2023") and had been deleted some time ago. When deleted, the file-tree entry was removed from the visible tree; the sharing record was not. `/2/sharing/list_folders` surfaced it with empty `path_display`, alongside 35 other no-path shared-folder records accumulated through the account's history. `/2/sharing/get_folder_metadata` on sfid 4087858721 returned `parent_shared_folder_id=4033641409`, the same id as /2023-05 Signed. So in Dropbox's sharing graph, /2023-05 Signed had a child shared folder and was therefore not unshareable, even though the file-tree showed it as a leaf top-level folder.
 
-Two live `dropbox.com/scl/fo/9pg4b7ufuxnpbkrl3vohe/...` public links were also still active, pointing at the contents of the inactive folder. These were not visible from /2023-05 Signed's sharing settings because the inactive child was hidden from any path UI.
+Two live `dropbox.com/scl/fo/9pg4b7ufuxnpbkrl3vohe/...` public links were also still LIVE, pointing at the contents of the no-path folder. These were not visible from /2023-05 Signed's sharing settings because the no-path child was hidden from any path UI.
 
 ## Things tried that did not work
 
 `/2/sharing/unshare_folder` directly on sfid 4087858721 launched async, polled, and failed with nested `no_permission`.
 
-`/2/sharing/set_access_inheritance` with `no_inherit` on either sfid (parent or inactive child) returned HTTP 409 `no_permission`. Per Dropbox docs the endpoint is "only permitted for shared folders in a shared team root, and only if the current user is the owner". The account in this story is `account_type: basic` and both folders had `is_team_folder=false, is_inside_team_folder=false`, so the endpoint is gated off entirely.
+`/2/sharing/set_access_inheritance` with `no_inherit` on either sfid (parent or no-path child) returned HTTP 409 `no_permission`. Per Dropbox docs the endpoint is "only permitted for shared folders in a shared team root, and only if the current user is the owner". The account in this story is `account_type: basic` and both folders had `is_team_folder=false, is_inside_team_folder=false`, so the endpoint is gated off entirely.
 
 `/2/files/list_folder` on `/2023-05 Signed/10-05-2023` with `include_deleted=true` returned `path/not_found`. Deleted folders do not respond to path-based list calls.
 
 ## What worked
 
-`/2/sharing/mount_folder shared_folder_id=4087858721` succeeded. Dropbox re-mounted the inactive folder at /10-05-2023, top-level, chosen by Dropbox (not under /2023-05 Signed). `/2/sharing/list_shared_links path=/10-05-2023` then surfaced the two live public links, and `/2/sharing/revoke_shared_link` cleared each. `/2/sharing/unshare_folder shared_folder_id=4087858721` then succeeded normally: the async job completed in seconds, the sharing record cleared. Finally `/2/sharing/unshare_folder shared_folder_id=4033641409` (the original target) succeeded with no further obstruction.
+`/2/sharing/mount_folder shared_folder_id=4087858721` succeeded. Dropbox placed the folder at /10-05-2023, top-level, chosen by Dropbox (not under /2023-05 Signed). `/2/sharing/list_shared_links path=/10-05-2023` then surfaced the two live public links, and `/2/sharing/revoke_shared_link` cleared each. `/2/sharing/unshare_folder shared_folder_id=4087858721` then succeeded normally: the async job completed in seconds, the sharing record cleared. Finally `/2/sharing/unshare_folder shared_folder_id=4033641409` (the original target) succeeded with no further obstruction.
 
 ## Cleanup
 

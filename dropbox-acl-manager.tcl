@@ -135,14 +135,14 @@ proc dbx_mount_folder {token sfid} {
 }
 
 proc dbx_list_children {token parent_sfid} {
-    # Returns SharedFolderMetadata for all shared folders (active or
-    # inactive) whose parent_shared_folder_id matches parent_sfid. Both
-    # kinds block the parent's unshare per Dropbox's rules.
+    # Returns SharedFolderMetadata for all shared folders (with or
+    # without a path) whose parent_shared_folder_id matches parent_sfid.
+    # Both kinds block the parent's unshare per Dropbox's rules.
     #
     # list_folders is unreliable: it omits parent_shared_folder_id from
-    # some active entries even when get_folder_metadata reports it. We
-    # therefore re-query get_folder_metadata for any entry where the
-    # field is missing in the list result. See docs/DROPBOX.md.
+    # some entries that have a path even when get_folder_metadata reports
+    # it. We therefore re-query get_folder_metadata for any entry where
+    # the field is missing in the list result. See docs/DROPBOX.md.
     set out [list]
     set all [list]
     set body [::json::write::object limit 1000]
@@ -178,11 +178,11 @@ proc dbx_list_children {token parent_sfid} {
 
 proc try_unshare_sfid {token sfid} {
     # Recursively unshare a shared folder by sfid. Revokes any shared links
-    # on the active path, attempts unshare_folder, and on no_permission
+    # on its path if it has one, attempts unshare_folder, and on no_permission
     # tries two escape hatches in order:
-    #   1. enumerate child shared folders (active and inactive), mount the
-    #      inactive ones, recurse on each, retry the parent;
-    #   2. if the folder is itself an active nested shared folder (has
+    #   1. enumerate child shared folders (with and without a path), mount
+    #      the no-path ones, recurse on each, retry the parent;
+    #   2. if the folder is itself a nested shared folder with a path (has
     #      parent_shared_folder_id and a path), move it to top-level via
     #      files/move_v2 to sever the inheritance link, retry.
     # Returns 1 on success, 0 otherwise. See docs/DROPBOX.md.
@@ -196,7 +196,7 @@ proc try_unshare_sfid {token sfid} {
     if {$path ne ""} {
         set label "$path (id $sfid)"
     } else {
-        set label "\"$name\" (id $sfid, inactive)"
+        set label "\"$name\" (id $sfid, no path)"
     }
 
     if {$path ne ""} {
@@ -220,16 +220,16 @@ proc try_unshare_sfid {token sfid} {
         puts "    descending into [llength $kids] child shared folder(s) ..."
         foreach k $kids {
             set k_sfid [dict get $k shared_folder_id]
-            set k_active 0
+            set k_has_path 0
             if {[dict exists $k path_display] && [dict get $k path_display] ne ""} {
-                set k_active 1
+                set k_has_path 1
             }
-            if {!$k_active} {
+            if {!$k_has_path} {
                 if {[catch {set mm [dbx_mount_folder $token $k_sfid]} merr]} {
                     puts "    mount_folder $k_sfid failed: $merr; skipping"
                     continue
                 }
-                puts "    mounted inactive child $k_sfid at [dict get $mm path_display]"
+                puts "    mounted no-path child $k_sfid at [dict get $mm path_display]"
             }
             if {[catch {try_unshare_sfid $token $k_sfid} kerr]} {
                 puts "    error processing child $k_sfid: $kerr"
