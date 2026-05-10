@@ -134,6 +134,22 @@ proc dbx_mount_folder {token sfid} {
         [::json::write::object shared_folder_id [::json::write::string $sfid]]]
 }
 
+proc dbx_list_all_folders {token} {
+    # Paginates /2/sharing/list_folders and returns every SharedFolderMetadata
+    # entry the account knows about (with-path, no-path, owned, joined).
+    set out [list]
+    set body [::json::write::object limit 1000]
+    set resp [dbx_call $token /2/sharing/list_folders $body]
+    while {1} {
+        foreach e [dict get $resp entries] { lappend out $e }
+        if {[dict exists $resp cursor] && [dict get $resp cursor] ne ""} {
+            set body [::json::write::object cursor [::json::write::string [dict get $resp cursor]]]
+            set resp [dbx_call $token /2/sharing/list_folders/continue $body]
+        } else break
+    }
+    return $out
+}
+
 proc dbx_list_children {token parent_sfid} {
     # Returns SharedFolderMetadata for all shared folders (with or
     # without a path) whose parent_shared_folder_id matches parent_sfid.
@@ -144,16 +160,7 @@ proc dbx_list_children {token parent_sfid} {
     # it. We therefore re-query get_folder_metadata for any entry where
     # the field is missing in the list result. See docs/DROPBOX.md.
     set out [list]
-    set all [list]
-    set body [::json::write::object limit 1000]
-    set resp [dbx_call $token /2/sharing/list_folders $body]
-    while {1} {
-        foreach e [dict get $resp entries] { lappend all $e }
-        if {[dict exists $resp cursor] && [dict get $resp cursor] ne ""} {
-            set body [::json::write::object cursor [::json::write::string [dict get $resp cursor]]]
-            set resp [dbx_call $token /2/sharing/list_folders/continue $body]
-        } else break
-    }
+    set all [dbx_list_all_folders $token]
     foreach e $all {
         set sfid [dict get $e shared_folder_id]
         if {$sfid eq $parent_sfid} continue
@@ -400,7 +407,47 @@ proc cmd_unshare {path force_recursive} {
     puts "Done."
 }
 
-set usage "Usage: tclsh dropbox-acl-manager.tcl unshare \[-r\] <dropbox-path>"
+proc cmd_list_shares {} {
+    # Lists shared folders that are top of the sharing graph: with a path
+    # and not inherited from another share. Skips no-path (deleted) records;
+    # they need a separate command. Folder scope only this turn.
+    set token [read_dropbox_token]
+    set all [dbx_list_all_folders $token]
+    set total [llength $all]
+    set rows [list]
+    foreach e $all {
+        if {![dict exists $e path_display]} continue
+        set path [dict get $e path_display]
+        if {$path eq ""} continue
+        if {[dict exists $e parent_shared_folder_id]} continue
+        set sfid [dict get $e shared_folder_id]
+        # list_folders may have silently omitted parent_shared_folder_id;
+        # confirm via get_folder_metadata before declaring top-level.
+        if {[catch {set m [dbx_call $token /2/sharing/get_folder_metadata \
+                [::json::write::object shared_folder_id [::json::write::string $sfid]]]}]} {
+            continue
+        }
+        if {[dict exists $m parent_shared_folder_id]} continue
+        set access ""
+        if {[dict exists $e access_type .tag]} { set access [dict get $e access_type .tag] }
+        lappend rows [list $path $sfid $access]
+    }
+    set rows [lsort -index 0 -nocase $rows]
+    foreach r $rows {
+        lassign $r p s a
+        if {$a ne ""} {
+            puts "$p (id $s)  \[$a\]"
+        } else {
+            puts "$p (id $s)"
+        }
+    }
+    puts "[llength $rows] top-level shared folder(s) (of $total total in list_folders)."
+}
+
+set usage "Usage: tclsh dropbox-acl-manager.tcl <subcommand> \[args\]
+Subcommands:
+  unshare \[-r\] <dropbox-path>
+  list-shares"
 
 if {[llength $argv] < 1} { puts stderr $usage; exit 1 }
 switch -- [lindex $argv 0] {
@@ -416,6 +463,10 @@ switch -- [lindex $argv 0] {
         }
         if {$path eq ""} { puts stderr $usage; exit 1 }
         cmd_unshare $path $force_recursive
+    }
+    list-shares {
+        if {[llength $argv] > 1} { puts stderr $usage; exit 1 }
+        cmd_list_shares
     }
     default { puts stderr $usage; exit 1 }
 }
