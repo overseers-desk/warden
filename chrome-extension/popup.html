@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  body { font: 13px/1.4 system-ui, sans-serif; width: 360px; margin: 0; padding: 12px; }
+  h2 { font-size: 13px; margin: 0 0 8px; color: #555; }
+  .field { margin-bottom: 10px; }
+  .label { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #888; margin-bottom: 2px; }
+  .value { word-break: break-all; background: #f4f4f6; border-radius: 4px; padding: 6px 8px; }
+  .row { display: flex; gap: 6px; align-items: flex-start; }
+  .row .value { flex: 1; }
+  button { font: inherit; cursor: pointer; border: 1px solid #ccc; background: #fff; border-radius: 4px; padding: 6px 8px; white-space: nowrap; }
+  button:hover { background: #f0f0f0; }
+  .err { color: #b00; }
+  .muted { color: #999; font-size: 11px; margin-top: 2px; }
+</style>
+</head>
+<body>
+  <h2>OneDrive folder</h2>
+  <div id="content">Reading current tab…</div>
+  <script src="popup.js"></script>
+</body>
+</html>
