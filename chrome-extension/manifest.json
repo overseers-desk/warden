@@ -2,12 +2,7 @@
   "manifest_version": 3,
   "name": "OneDrive Folder Path & Short Link",
   "version": "0.1.0",
-  "description": "Shows the current OneDrive folder's path and a short ?id=<resid> URL that addresses it by id instead of the full path.",
-  "permissions": ["activeTab"],
-  "action": {
-    "default_title": "OneDrive Folder Path & Short Link",
-    "default_popup": "popup.html"
-  },
+  "description": "Shows the current OneDrive folder's path and a short ?id=<resid> URL that addresses it by id instead of the full path, in a bar at the top of the page.",
   "content_scripts": [
     {
       "matches": [
