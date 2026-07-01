@@ -737,7 +737,7 @@ proc format_file_size {bytes} {
 
 proc extract_item_metadata {item_dict} {
     # Safely extract metadata fields from a Graph API item dict
-    # Returns a dict with keys: name, type, created_by, created_date, modified_by, modified_date, size
+    # Returns a dict with keys: name, type, created_by, created_date, modified_by, modified_date, size, caption
     set meta {}
 
     dict set meta name [expr {[dict exists $item_dict name] ? [dict get $item_dict name] : "N/A"}]
@@ -771,6 +771,9 @@ proc extract_item_metadata {item_dict} {
     } else {
         dict set meta size "N/A"
     }
+
+    # Caption is the server-side description (the web "Add a caption" field)
+    dict set meta caption [expr {[dict exists $item_dict description] ? [dict get $item_dict description] : ""}]
 
     return $meta
 }
@@ -1008,6 +1011,9 @@ proc print_item_metadata {item_dict} {
     puts [format "   %-17s %s" "Modified by:" [dict get $meta modified_by]]
     puts [format "   %-17s %s" "Modified:" [dict get $meta modified_date]]
     puts [format "   %-17s %s" "Size:" [dict get $meta size]]
+    if {[dict get $meta caption] ne ""} {
+        puts [format "   %-17s %s" "Caption:" [dict get $meta caption]]
+    }
     puts ""
 }
 
@@ -2453,8 +2459,8 @@ proc make_http_request {url headers {method GET} {body ""}} {
         # Use all headers passed in (not just Authorization)
         set opts [list -headers $headers -timeout 30000 -method $method]
         
-        # Add body for POST requests
-        if {$method eq "POST" && $body ne ""} {
+        # Add body for methods that carry one
+        if {$body ne "" && $method in {POST PATCH PUT}} {
             lappend opts -query $body
         }
         
@@ -2558,6 +2564,37 @@ proc invite_user_to_item {item_id email role access_token} {
         return [list "error" "Item not found"]
     } else {
         return [list "error" "Failed to invite user: HTTP $status"]
+    }
+}
+
+proc set_item_description {item_id description access_token} {
+    # Set (or clear) an item's server-side description, the field behind the
+    # OneDrive web "Add a caption". Editable via PATCH with no file re-upload,
+    # and indexed by OneDrive search.
+    # Returns: {status message}
+
+    set url [build_graph_api_url "/me/drive/items/$item_id"]
+    set headers [list Authorization "Bearer $access_token" Content-Type "application/json"]
+
+    # json::write escapes quotes, accents and newlines in arbitrary caption text
+    set body_json [json::write object description [json::write string $description]]
+
+    set result [make_http_request $url $headers PATCH $body_json]
+    set status [lindex $result 0]
+
+    if {$status eq "200"} {
+        if {$description eq ""} {
+            return [list "ok" "Caption cleared"]
+        }
+        return [list "ok" "Caption set to: $description"]
+    } elseif {$status eq "403"} {
+        return [list "error" "Insufficient permissions to set the caption"]
+    } elseif {$status eq "404"} {
+        return [list "error" "Item not found"]
+    } elseif {$status eq "401"} {
+        return [list "error" "Token expired or invalid"]
+    } else {
+        return [list "error" "Failed to set caption: HTTP $status"]
     }
 }
 
@@ -3449,6 +3486,27 @@ proc invite_user_cli {item_id user_email read_only remote_name} {
     }
 }
 
+proc set_caption_cli {item_id caption remote_name} {
+    # CLI wrapper for setting an item's caption (by ID)
+    # Initial display messages should be handled by caller
+
+    # Get access token with full capability requirement
+    set access_token [cli_get_full_token $remote_name]
+    if {$access_token eq ""} {
+        return
+    }
+
+    set result [set_item_description $item_id $caption $access_token]
+    set status [lindex $result 0]
+    set message [lindex $result 1]
+
+    if {$status eq "ok"} {
+        puts "✅ $message"
+    } else {
+        puts "❌ $message"
+    }
+}
+
 proc list_user_access {item_id user_email max_depth item_type remote_name} {
     # List items where user has access
     # Initial display messages should be handled by caller
@@ -3826,6 +3884,7 @@ proc main {argc argv} {
         {only-user.arg "" "Filter to items USER has access to"}
         {remove-user.arg "" "Remove USER's access (destructive)"}
         {invite.arg "" "Invite USER with read/write access (inherited by children)"}
+        {set-caption.arg "\x00" "Set the item's caption/description (searchable in OneDrive); use \"\" to clear"}
         {r "Include children in scan (recursive, default depth: 3)"}
         {recursive "Include children in scan (recursive, default depth: 3)"}
         {max-depth.arg "0" "Max depth (default: 3 with -r, 0 otherwise)"}
@@ -3861,6 +3920,7 @@ proc main {argc argv} {
     set only_user $params(only-user)
     set remove_user $params(remove-user)
     set invite_user $params(invite)
+    set caption $params(set-caption)
     set item_type $params(type)
     set output_format $params(format)
     set dry_run $params(dry-run)
@@ -3889,15 +3949,22 @@ proc main {argc argv} {
     if {$only_user ne ""} { incr action_count }
     if {$remove_user ne ""} { incr action_count }
     if {$invite_user ne ""} { incr action_count }
-    
+    if {$caption ne "\x00"} { incr action_count }
+
     if {$action_count > 1} {
-        puts "Error: --only-user, --remove-user, and --invite are mutually exclusive"
+        puts "Error: --only-user, --remove-user, --invite, and --set-caption are mutually exclusive"
         exit 1
     }
     
     # Validate --invite is not used with recursive flags
     if {$invite_user ne "" && ($r_flag_used || $max_depth_explicit)} {
         puts "Error: --invite cannot be used with -r or --max-depth (invitations are always inherited)"
+        exit 1
+    }
+
+    # Validate --set-caption is not used with recursive flags (captions are per-item)
+    if {$caption ne "\x00" && ($r_flag_used || $max_depth_explicit)} {
+        puts "Error: --set-caption cannot be used with -r or --max-depth (captions are per-item)"
         exit 1
     }
     
@@ -3962,7 +4029,29 @@ proc main {argc argv} {
         puts ""
         
         invite_user_cli $item_id $invite_user $read_only $remote_name
-        
+
+    } elseif {$caption ne "\x00"} {
+        # Set (or clear) the item's caption (server-side description)
+        if {$caption eq ""} {
+            puts "🧹 Clearing caption on path: $path"
+        } else {
+            puts "📝 Setting caption on path: $path"
+            puts "Caption: $caption"
+        }
+        puts ""
+
+        # Resolve path to item ID (handles token and errors)
+        set resolve_result [cli_resolve_path_for_command $path $remote_name]
+        if {[llength $resolve_result] == 0} {
+            exit 1
+        }
+        lassign $resolve_result access_token item_id item_dict
+        set item_name [dict get $item_dict name]
+        puts "📁 Found item: $item_name (ID: $item_id)"
+        puts ""
+
+        set_caption_cli $item_id $caption $remote_name
+
     } elseif {$remove_user ne ""} {
         # Remove user permissions
         puts "🗑️  Removing user permissions"
