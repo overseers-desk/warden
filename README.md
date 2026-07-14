@@ -1,224 +1,126 @@
-# OneDrive ACL Manager (TCL Version)
+# OneDrive ACL Manager (TCL version)
 
-## Does This Sound Familiar?
+OneDrive tells you who can access a folder, but only the one you're looking at, not the subfolders beneath it. Someone you shared a subfolder with years ago may still have access, and you won't know unless you open every folder by hand. OneDrive ACL Manager scans a whole folder tree at once and reports every permission at every level, so you can see who has access to what.
 
-If you've shared your OneDrive folders with friends, family, or collaborators over the years and you've lost track of who has access to what...
+## What it does
 
-If you've stopped working with someone and you're worried they might still have access to your personal files somewhere deep in your folder structure...
+- Recursive ACL scan of a folder tree, with smart pruning of inherited permissions
+- Find everything a given user can access across a tree
+- Remove a user's access across a tree, with a dry-run preview
+- Invite a user to a folder, inherited by its children
+- Scan folders, files, or both
+- Reads tokens from both rclone's config and its own `token.json`, for read-only or full-permission work
 
-If you're trying to clean up your OneDrive and need to audit who can see what before sharing more files...
+Two interfaces: a Tcl/Tk GUI for browsing folders and viewing permissions (a subset of the commands), and a command line with the full set, including the recursive operations.
 
-When you know which folder to check, you can find out "Who can see my tax documents?" or "Who has access to my family photos?" within OneDrive. But that doesn't help if you don't know which folders were shared and wanted to search or have an overview.
+## Install
 
-**You need this tool.**
+### Windows (tested on Windows 11)
 
-## The Problem
-
-OneDrive shows you permissions for each folder, but not what's in the subfolders below. Someone you shared a subfolder with years ago might still have access - and you won't know unless you check every folder manually.
-
-## The Solution
-
-**OneDrive ACL Manager** scans entire folder hierarchies in one go, showing you all permissions at every level. Finally answer: "Who has access to what?"
-
-## Features
-
-**Dual Interface - Choose Your Workflow:**
-
-- **GUI Mode (Tcl/Tk)** - Interactive browsing for exploring folders and viewing permissions visually (subset of command-line functions)
-- **Command-line Mode** - Full feature set including recursive operations for auditing entire hierarchies (e.g., locate all files accessible by a given user, remove permissions across folder trees)
-
-**Core Capabilities:**
-
-- Recursive ACL scanning - Audit complete folder hierarchies to find all access grants
-- Find items explicitly shared with specific users across folder trees
-- Remove user permissions recursively with dry-run mode
-- Invite users to folders with inherited permissions
-- Scan folders and files with smart pruning for inherited permissions
-- Dual token system: Uses both rclone configuration and token.json for flexible authentication
-
-## Installation: Windows
-
-1. **Download acl-manager.tcl** to your preferred location (e.g., user home directory)
-
-2. **Ensure rclone.conf exists** at `%APPDATA%\rclone\rclone.conf`:
-   - A working configuration file is required (not yet tested without one)
-   - Installing rclone itself is optional; copying a working rclone.conf from another system is sufficient
-
-3. **Install Magicsplat TCL/TK 9.0**:
-   - Other versions have not been tested
-   - Runtime environment will be installed at `%APPDATA%\Local\Apps\Tcl90`
-
-4. **Run the application**:
+1. Put `acl-manager.tcl` where you like (e.g. your home directory).
+2. Provide `rclone.conf` at `%APPDATA%\rclone\rclone.conf`. A working config is required (untested without one). You don't need rclone itself installed; copying a working `rclone.conf` from another machine is enough.
+3. Install Magicsplat Tcl/Tk 9.0 (other versions untested); it lands at `%APPDATA%\Local\Apps\Tcl90`.
+4. Run it:
    ```
    C:>"AppData\Local\Apps\Tcl90\bin\wish.exe" acl-manager.tcl
    ```
 
-Tested on Windows 11.
+### Linux and macOS
 
-
-## Installation: Linux and OS X
-
-1. **Install rclone and configure with OneDrive**:
-   ```bash
-   rclone config
-   ```
-
-2. **Install Tcl packages**:
-   ```bash
-   # Ubuntu/Debian:
-   sudo apt-get install tcllib tcl-tls
-   
-   # OS X:
-   brew install tcl-tk
-   ```
+```bash
+rclone config                              # set up your OneDrive remote
+sudo apt-get install tcllib tcl-tls        # Ubuntu/Debian
+brew install tcl-tk                        # macOS
+```
 
 ## Usage
 
-### GUI Mode
-
+GUI:
 ```bash
 wish acl-manager.tcl [item_path] [remote_name]
 ```
 
-### Command Line Mode
-
-The CLI uses standard option-first interface for auditing access across folder hierarchies:
-
+Command line:
 ```bash
 tclsh acl-manager.tcl [OPTIONS] [PATH]
 ```
 
-**PATH**: Folder or file to inspect (default: `/` - root) - must come after all options
+`PATH` is the folder or file to inspect (default `/`, the root) and must come after all options. Options take either one dash or two (`-r` or `--recursive`); help prints the single-dash form, both work.
 
-**Note**: Options accept both single dash (`-option`) and double dash (`--option`) syntax. Help output shows single dashes but both work.
-
-**Core Options:**
-- `-r, --recursive` - **Scan folder and all subfolders** (default max-depth: 3) - Use this for complete access audits
-- `--max-depth N` - Control recursion depth (use with `-r`, or set explicitly for any depth)
-- `--type TYPE` - Item types to scan: `folders`, `files`, or `both` (default: `folders`)
-
-**Filtering and Actions:**
-- `--only-user USER` - Show only items USER has access to (works with or without `-r`)
-- `--remove-user USER` - Remove USER's access from found items (destructive, requires `-r` or explicit depth)
-- `--invite USER` - Invite USER with read/write access (inherited by children, cannot use with `-r`)
-
-**Modifiers:**
-- `--dry-run` - Preview changes without executing (with `--remove-user`)
-- `--read-only` - Grant read-only instead of read/write (with `--invite`)
-- `--debug` - Enable debug output
-- `--remote REMOTE` - OneDrive remote name (default: `OneDrive`)
-- `--help` - Display help message
+- `-r, --recursive` - scan a folder and its subfolders (default max depth 3)
+- `--max-depth N` - set recursion depth (with `-r`, or alone for any depth)
+- `--type folders|files|both` - what to scan (default `folders`)
+- `--only-user USER` - show only what USER can access (with or without `-r`)
+- `--remove-user USER` - remove USER's access from what's found; destructive, needs `-r` or an explicit depth
+- `--invite USER` - invite USER with read/write, inherited by children; not usable with `-r`
+- `--dry-run` - preview a `--remove-user` without changing anything
+- `--read-only` - invite with read-only instead of read/write
+- `--debug` - debug output
+- `--remote REMOTE` - OneDrive remote name (default `OneDrive`)
+- `--help` - show help
 
 ### Examples
 
 ```bash
-# ==================== RECURSIVE AUDITING (Primary Use Cases) ====================
-
-# Audit who has access to Financial folder and ALL subfolders
+# Audit a folder and everything under it
 tclsh acl-manager.tcl -r "Finance"
 
-# Deep audit with custom depth (e.g., for complex hierarchies)
+# ...deeper than the default 3 levels
 tclsh acl-manager.tcl -r --max-depth 10 "Projects"
 
-# Audit including both folders AND files
+# ...including files, not just folders
 tclsh acl-manager.tcl -r --type both "Confidential"
 
 # Find everywhere an ex-employee still has access
 tclsh acl-manager.tcl --only-user exemployee@example.com -r "Company"
 
-# ==================== SINGLE-ITEM OPERATIONS ====================
-
-# Check ACL of one specific folder (no recursion)
+# One folder, no recursion
 tclsh acl-manager.tcl "Finance/Budget2025"
 
-# Check if specific user has access to one folder
+# Whether one user can reach one folder
 tclsh acl-manager.tcl --only-user bob@example.com "Finance/Budget2025"
 
-# ==================== REMEDIATION OPERATIONS ====================
-
-# Remove ex-employee from entire hierarchy (dry run first!)
+# Remove an ex-employee across a tree: preview first, then do it
 tclsh acl-manager.tcl --remove-user exemployee@example.com -r --dry-run "Projects"
-
-# Actually remove after reviewing dry-run output
 tclsh acl-manager.tcl --remove-user exemployee@example.com -r "Projects"
 
-# ==================== GRANTING ACCESS ====================
-
-# Invite user to folder (automatically inherited by subfolders)
+# Invite someone to a folder (children inherit it)
 tclsh acl-manager.tcl --invite newaccountant@example.com "Finance"
 
-# Invite with read-only access
+# ...read-only
 tclsh acl-manager.tcl --invite auditor@example.com --read-only "Reports"
 
-# ==================== GUI MODE ====================
-
-# Launch GUI for interactive browsing
+# GUI for interactive browsing
 wish acl-manager.tcl "Finance"
 ```
 
-## Permission Requirements
+## Permissions and tokens
 
-- **Read operations** (scanning, listing ACLs): Requires `Files.Read` (standard OneDrive token)
-- **Write operations** (inviting users, removing permissions): Requires `Files.ReadWrite` + `Sites.Manage.All`
+Reading (scanning, listing ACLs) needs the `Files.Read` scope; writing (invite, remove) needs `Files.ReadWrite` plus `Sites.Manage.All`.
 
-**Token Sources:**
+Tokens come from two places: `rclone.conf` (usually read-only, `Files.Read`) and `token.json` in the application directory (full permissions, created automatically when needed). The app prefers `token.json` and falls back to `rclone.conf` for read-only work. When a write needs more than `rclone.conf` grants, it opens a web sign-in to create or update `token.json`. Expired tokens are refreshed automatically when possible.
 
-The application uses two token sources:
-
-1. **rclone.conf**: Read-only tokens from your rclone configuration (typically `Files.Read` scope)
-2. **token.json**: Full-permission tokens stored in the application directory (created automatically when needed)
-
-For write operations, the application will automatically request web-based authentication to create or update `token.json` with the required permissions. The application prioritises `token.json` when available and falls back to rclone.conf for read-only operations.
-
-**Safety Features:**
-
-- `--dry-run` shows exactly what would be changed before execution
-- Confirmation prompts required for all destructive operations
-- Cannot remove owner permissions (enforced)
+Safety: destructive operations prompt for confirmation (not bypassable) and owner permissions can't be removed. Always `--dry-run` a removal first.
 
 ## Troubleshooting
 
-**Token expired:**
+**Token expired and auto-refresh failed.** For `token.json`, run the GUI and do any write operation to trigger a fresh web sign-in. For `rclone.conf`, run any rclone command, e.g. `rclone about OneDrive:`.
 
-The application automatically refreshes expired tokens when possible. If automatic refresh fails:
+**Missing packages.** `sudo apt-get install tcllib tcl-tls`.
 
-- For `token.json`: Run the script in GUI mode and perform any write operation to trigger web-based re-authentication
-- For rclone.conf: Refresh by running any rclone command:
-  ```bash
-  rclone about OneDrive:
-  ```
+**Access denied.** Check the path, that you're allowed to view the ACL, and that your rclone token has enough scope.
 
-**Package errors:**
-```bash
-# Install missing packages
-sudo apt-get install tcllib tcl-tls
-```
+## API
 
-**Access denied:**
-- Verify the item path is correct
-- Check that you have permission to view the ACL
-- Ensure your rclone token has sufficient permissions
+Microsoft Graph:
+- `GET /me/drive/root:/{item-path}` (item info)
+- `GET /me/drive/items/{item-id}/permissions` (permissions)
+- `GET /me/drive/items/{item-id}/children` (folder contents)
+- `POST /me/drive/items/{item-id}/invite` (invite)
+- `DELETE /me/drive/items/{item-id}/permissions/{perm-id}` (remove permission)
 
-## API Details
-
-Uses Microsoft Graph API endpoints:
-- `GET /me/drive/root:/{item-path}` - Get item info
-- `GET /me/drive/items/{item-id}/permissions` - Get permissions
-- `GET /me/drive/items/{item-id}/children` - List folder contents
-- `POST /me/drive/items/{item-id}/invite` - Invite users
-- `DELETE /me/drive/items/{item-id}/permissions/{perm-id}` - Remove permissions
-
-OAuth tokens are obtained from either `token.json` (full permissions) or the rclone configuration file (read-only fallback) and used directly in API requests. The rclone configuration path is platform-specific: Windows uses `%APPDATA%\rclone\rclone.conf`, while Unix-like systems use `~/.config/rclone/rclone.conf`.
-
-## Security Notes
-
-- OAuth tokens are read from rclone.conf and token.json
-- The application automatically creates and updates `token.json` when higher permissions are needed (via web-based OAuth flow)
-- Tokens expire and are automatically refreshed when possible
-- The script can read ACL information and modify permissions; use with appropriate caution
-- Permission removal operations require confirmation (cannot be bypassed)
-- Always use `--dry-run` first when removing permissions
+OAuth tokens (from `token.json` for full access, else `rclone.conf` read-only) go straight into the requests. The rclone config path is `%APPDATA%\rclone\rclone.conf` on Windows and `~/.config/rclone/rclone.conf` on Unix-like systems.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT, see [LICENSE](LICENSE).
