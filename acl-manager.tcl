@@ -30,6 +30,7 @@ package require json
 package require json::write
 package require tls
 package require cmdline
+package require yaml
 
 # Configure TLS for HTTPS requests
 ::http::register https 443 [list ::tls::socket -autoservername 1]
@@ -2541,23 +2542,41 @@ proc make_http_request {url headers {method GET} {body ""}} {
 # Microsoft Graph API Operations for ACL Editing
 # ============================================================================
 
-proc invite_user_to_item {item_id email role access_token} {
+proc invite_user_to_item {item_id email role access_token {quiet 0}} {
     # Invite a user to an item with specified role
     # role: "read" or "write"
+    # quiet: suppress the notification email (sendInvitation:false); if the
+    #        service rejects that (400), retry with notification and report
+    #        status "ok-notified" so callers can surface the difference
     # Returns: {status message}
-    
+
     set url "https://graph.microsoft.com/v1.0/me/drive/items/$item_id/invite"
     set headers [list Authorization "Bearer $access_token" Content-Type "application/json"]
-    
-    # Build request body - simple JSON construction
-    set body_json "\{\"requireSignIn\":true,\"roles\":\[\"$role\"\],\"recipients\":\[\{\"email\":\"$email\"\}\],\"message\":\"You have been granted $role access to this item.\"\}"
-    
+
+    set body_common [list \
+        requireSignIn true \
+        roles [json::write array [json::write string $role]] \
+        recipients [json::write array [json::write object email [json::write string $email]]]]
+    if {$quiet} {
+        set body_json [json::write object {*}$body_common sendInvitation false]
+    } else {
+        set body_json [json::write object {*}$body_common \
+            message [json::write string "You have been granted $role access to this item."]]
+    }
+
     set result [make_http_request $url $headers POST $body_json]
     set status [lindex $result 0]
     set data [lindex $result 1]
-    
+
     if {$status eq "200" || $status eq "201"} {
         return [list "ok" "Successfully invited $email with $role permission"]
+    } elseif {$quiet && $status eq "400"} {
+        # Service refused the quiet form; fall back to a notifying invite
+        set result [invite_user_to_item $item_id $email $role $access_token 0]
+        if {[lindex $result 0] eq "ok"} {
+            return [list "ok-notified" "Invited $email with $role permission (service refused quiet invite; notification email sent)"]
+        }
+        return $result
     } elseif {$status eq "403"} {
         return [list "error" "Insufficient permissions to invite users"]
     } elseif {$status eq "404"} {
@@ -2565,6 +2584,65 @@ proc invite_user_to_item {item_id email role access_token} {
     } else {
         return [list "error" "Failed to invite user: HTTP $status"]
     }
+}
+
+proc get_item_by_id {item_id access_token} {
+    # Fetch an item by its stable id; the id survives renames and moves,
+    # which is what makes policy drift detectable.
+    # Returns: {ok item_dict} | {not_found {}} | {error {}}
+    set url [build_graph_api_url "/me/drive/items/$item_id?select=id,name,parentReference"]
+    set headers [list Authorization "Bearer $access_token"]
+    set result [make_http_request $url $headers]
+    set status [lindex $result 0]
+    if {$status eq "200"} {
+        return [list "ok" [json::json2dict [lindex $result 1]]]
+    } elseif {$status eq "404" || $status eq "400"} {
+        return [list "not_found" {}]
+    }
+    return [list "error" {}]
+}
+
+proc item_actual_path {item_dict} {
+    # Slash path of an item relative to the drive root, from one GET's
+    # parentReference.path (format "/drive/root:/Parent/Sub"); empty string
+    # when the reference is absent (rare; caller may fall back to
+    # get_item_path's parent-chain walk).
+    if {![dict exists $item_dict parentReference path]} {
+        return ""
+    }
+    set parent_path [dict get $item_dict parentReference path]
+    set idx [string first "root:" $parent_path]
+    if {$idx < 0} { return "" }
+    set rel [string range $parent_path [expr {$idx + 5}] end]
+    set rel [string trimleft $rel "/"]
+    # parentReference.path is URL-decoded by Graph already
+    set name [dict get $item_dict name]
+    if {$rel eq ""} { return $name }
+    return "$rel/$name"
+}
+
+proc move_item {item_id new_parent_id access_token} {
+    # Move an item under a new parent folder (PATCH parentReference).
+    # Moving a folder to the drive root converts its inherited permissions
+    # to unique ones, the only known way to delete inherited permissions on
+    # consumer OneDrive (docs/PHANTOM-INHERITANCE-BUG.md).
+    # Returns: {status message}
+    set url [build_graph_api_url "/me/drive/items/$item_id"]
+    set headers [list Authorization "Bearer $access_token" Content-Type "application/json"]
+    set body_json [json::write object parentReference \
+        [json::write object id [json::write string $new_parent_id]]]
+    set result [make_http_request $url $headers PATCH $body_json]
+    set status [lindex $result 0]
+    if {$status eq "200"} {
+        return [list "ok" "Moved"]
+    } elseif {$status eq "409"} {
+        return [list "error" "Name conflict at destination"]
+    } elseif {$status eq "403"} {
+        return [list "error" "Insufficient permissions to move item"]
+    } elseif {$status eq "404"} {
+        return [list "error" "Item not found"]
+    }
+    return [list "error" "Failed to move item: HTTP $status"]
 }
 
 proc set_item_description {item_id description access_token} {
@@ -2981,21 +3059,31 @@ proc get_item_path {item_id access_token} {
 }
 
 proc get_folder_permissions {folder_id access_token} {
-    # Get permissions for a folder
+    # Get permissions for a folder, following @odata.nextLink pagination
+    # (a permission on page 2 would otherwise read as absent)
     # Returns list of {status permissions} where status is "ok" or "error"
     set permissions_url [build_graph_api_url "/me/drive/items/$folder_id/permissions"]
     set headers [list Authorization "Bearer $access_token"]
-    set result [make_http_request $permissions_url $headers]
-    set status [lindex $result 0]
-    set data [lindex $result 1]
-    
-    if {$status eq "200"} {
+    set permissions {}
+
+    while {$permissions_url ne ""} {
+        set result [make_http_request $permissions_url $headers]
+        set status [lindex $result 0]
+        set data [lindex $result 1]
+
+        if {$status ne "200"} {
+            return [list "error" {}]
+        }
+
         set permissions_data [json::json2dict $data]
-        set permissions [dict get $permissions_data value]
-        return [list "ok" $permissions]
-    } else {
-        return [list "error" {}]
+        lappend permissions {*}[dict get $permissions_data value]
+        if {[dict exists $permissions_data @odata.nextLink]} {
+            set permissions_url [dict get $permissions_data @odata.nextLink]
+        } else {
+            set permissions_url ""
+        }
     }
+    return [list "ok" $permissions]
 }
 
 proc has_explicit_user_permission {permissions target_user_lower} {
@@ -3875,6 +3963,690 @@ proc gui_fetch_acl {item_id remote_name} {
 
 # Show help function
 
+# ============================================================================
+# Policy Audit & Enforcement
+# ============================================================================
+# A policy YAML file declares desired sharing state: groups (people),
+# collections (folder sets addressed by stable item id), and grants joining
+# the two. A folder's expected ACL is the union of grants over every
+# collection containing it, write beating read. closed: true on a collection
+# makes any live permission beyond the expected set a violation; on open
+# collections extras are reported but tolerated. Owner permissions are out of
+# scope on both sides.
+
+proc policy_member_email {member} {
+    # A group member is either a bare email string or a record
+    # {email ... name ... relationship ... reason ...}
+    if {[llength $member] % 2 == 0 && [dict exists $member email]} {
+        return [string tolower [dict get $member email]]
+    }
+    return [string tolower $member]
+}
+
+proc policy_resolve_group {groups name chain} {
+    # Recursive union of a group's members and includes.
+    # Returns a lowercased email list; errors on unknown names and cycles.
+    if {[lsearch -exact $chain $name] >= 0} {
+        error "group include cycle: [join $chain { -> }] -> $name"
+    }
+    if {![dict exists $groups $name]} {
+        if {[llength $chain] > 0} {
+            error "group '$name' referenced by '[lindex $chain end]' does not exist"
+        }
+        error "group '$name' does not exist"
+    }
+    set g [dict get $groups $name]
+    set emails {}
+    if {[dict exists $g members]} {
+        foreach m [dict get $g members] {
+            lappend emails [policy_member_email $m]
+        }
+    }
+    if {[dict exists $g includes]} {
+        foreach inc [dict get $g includes] {
+            lappend emails {*}[policy_resolve_group $groups $inc [concat $chain [list $name]]]
+        }
+    }
+    return [lsort -unique $emails]
+}
+
+proc policy_resolve_collection {collections name chain} {
+    # Recursive union of a collection's folders and includes.
+    # Returns a list of {path <p> id <i>} dicts; errors on unknown names,
+    # cycles, and folder entries missing path or id.
+    if {[lsearch -exact $chain $name] >= 0} {
+        error "collection include cycle: [join $chain { -> }] -> $name"
+    }
+    if {![dict exists $collections $name]} {
+        if {[llength $chain] > 0} {
+            error "collection '$name' referenced by '[lindex $chain end]' does not exist"
+        }
+        error "collection '$name' does not exist"
+    }
+    set c [dict get $collections $name]
+    set folders {}
+    if {[dict exists $c folders]} {
+        foreach f [dict get $c folders] {
+            if {![dict exists $f path] || ![dict exists $f id]} {
+                error "collection '$name' has a folder entry without both path and id"
+            }
+            lappend folders $f
+        }
+    }
+    if {[dict exists $c includes]} {
+        foreach inc [dict get $c includes] {
+            lappend folders {*}[policy_resolve_collection $collections $inc [concat $chain [list $name]]]
+        }
+    }
+    return $folders
+}
+
+proc policy_load {yaml_path} {
+    # Load and validate a policy file into the model the audit runs on:
+    #   entity  - root folder name paths are relative to
+    #   people  - email -> {name relationship reason} (for reporting)
+    #   plan    - folder id -> {path closed expected} with expected an
+    #             email -> role dict
+    # Throws a plain-message error on any structural problem.
+    set f [open $yaml_path r]
+    fconfigure $f -encoding utf-8
+    set yaml_text [read $f]
+    close $f
+
+    set policy [yaml::yaml2dict $yaml_text]
+    foreach key {entity groups collections grants} {
+        if {![dict exists $policy $key]} {
+            error "policy is missing its '$key' section"
+        }
+    }
+    set entity [dict get $policy entity]
+    set groups [dict get $policy groups]
+    set collections [dict get $policy collections]
+
+    # People metadata for reporting, first record wins
+    set people {}
+    dict for {gname g} $groups {
+        if {![dict exists $g members]} { continue }
+        foreach m [dict get $g members] {
+            if {[llength $m] % 2 != 0 || ![dict exists $m email]} { continue }
+            set email [string tolower [dict get $m email]]
+            if {[dict exists $people $email]} { continue }
+            set rec {}
+            foreach field {name relationship reason} {
+                if {[dict exists $m $field]} {
+                    dict set rec $field [dict get $m $field]
+                }
+            }
+            dict set people $email $rec
+        }
+    }
+
+    # Closed flag per folder id: closed if any collection containing it is closed
+    set closed_ids {}
+    dict for {cname c} $collections {
+        if {![dict exists $c closed] || ![dict get $c closed]} { continue }
+        foreach f [policy_resolve_collection $collections $cname {}] {
+            dict set closed_ids [dict get $f id] 1
+        }
+    }
+
+    # Expected ACL per folder from the grants
+    set plan {}
+    foreach grant [dict get $policy grants] {
+        foreach key {collection group roles} {
+            if {![dict exists $grant $key]} {
+                error "a grant is missing its '$key' field: $grant"
+            }
+        }
+        set role "read"
+        foreach r [dict get $grant roles] {
+            if {$r ni {read write}} {
+                error "grant on '[dict get $grant collection]' has unknown role '$r' (read or write)"
+            }
+            if {$r eq "write"} { set role "write" }
+        }
+        set emails [policy_resolve_group $groups [dict get $grant group] {}]
+        foreach f [policy_resolve_collection $collections [dict get $grant collection] {}] {
+            set fid [dict get $f id]
+            if {![dict exists $plan $fid]} {
+                dict set plan $fid [dict create \
+                    path [dict get $f path] \
+                    closed [expr {[dict exists $closed_ids $fid] ? 1 : 0}] \
+                    expected {}]
+            }
+            set expected [dict get $plan $fid expected]
+            foreach email $emails {
+                if {![dict exists $expected $email] || [dict get $expected $email] ne "write"} {
+                    dict set expected $email $role
+                }
+            }
+            dict set plan $fid expected $expected
+        }
+    }
+
+    # Folders in collections but granted nothing still deserve auditing
+    dict for {cname c} $collections {
+        foreach f [policy_resolve_collection $collections $cname {}] {
+            set fid [dict get $f id]
+            if {![dict exists $plan $fid]} {
+                dict set plan $fid [dict create \
+                    path [dict get $f path] \
+                    closed [expr {[dict exists $closed_ids $fid] ? 1 : 0}] \
+                    expected {}]
+            }
+        }
+    }
+
+    return [dict create entity $entity people $people plan $plan]
+}
+
+proc policy_containment_violations {model} {
+    # A closed folder under a more broadly granted ancestor is leak-prone:
+    # OneDrive has no deny, and a user newly added at the ancestor
+    # propagates into the child as an inherited permission until the next
+    # enforcement repair pass (docs/INHERITANCE-LEAKING-IN-LOCKED-FOLDERS.md).
+    # Advisory: flags any policy ancestor whose expected users exceed the
+    # closed child's (or hold write where the child grants read).
+    set plan [dict get $model plan]
+    set violations {}
+    dict for {fid fentry} $plan {
+        if {![dict get $fentry closed]} { continue }
+        set child_path [dict get $fentry path]
+        set child_expected [dict get $fentry expected]
+        dict for {aid aentry} $plan {
+            if {$aid eq $fid} { continue }
+            set apath [dict get $aentry path]
+            if {$apath eq "/" || [string match "$apath/*" $child_path]} {
+                dict for {email role} [dict get $aentry expected] {
+                    set ok [expr {[dict exists $child_expected $email] && \
+                        ([dict get $child_expected $email] eq "write" || $role eq "read")}]
+                    if {!$ok} {
+                        lappend violations [dict create \
+                            type containment path $child_path id $fid email $email \
+                            expected "" actual $role \
+                            detail "granted on ancestor '$apath' but not on this closed folder"]
+                    }
+                }
+            }
+        }
+    }
+    return $violations
+}
+
+proc acl_diff {expected live closed} {
+    # Diff desired vs live email->role dicts.
+    # Returns {to_add to_fix to_remove extras}: to_add email->role,
+    # to_fix email->{expected actual}, to_remove email->role (closed only),
+    # extras email->role (open collections, tolerated).
+    set to_add {}
+    set to_fix {}
+    set to_remove {}
+    set extras {}
+    dict for {email role} $expected {
+        if {![dict exists $live $email]} {
+            dict set to_add $email $role
+        } elseif {[dict get $live $email] ne $role} {
+            dict set to_fix $email [dict create expected $role actual [dict get $live $email]]
+        }
+    }
+    dict for {email role} $live {
+        if {![dict exists $expected $email]} {
+            if {$closed} {
+                dict set to_remove $email $role
+            } else {
+                dict set extras $email $role
+            }
+        }
+    }
+    return [list $to_add $to_fix $to_remove $extras]
+}
+
+proc policy_full_path {entity rel_path} {
+    # Policy folder paths are relative to the entity; "/" is the entity itself
+    if {$rel_path eq "/" || $rel_path eq ""} {
+        return $entity
+    }
+    return "$entity/$rel_path"
+}
+
+proc audit_folder {fid fentry entity access_token} {
+    # Audit one policy folder against the live drive.
+    # Returns {violations live_dict item_dict}; live_dict/item_dict are {} when
+    # the folder id no longer resolves.
+    set violations {}
+    set rel_path [dict get $fentry path]
+    set full_path [policy_full_path $entity $rel_path]
+
+    lassign [get_item_by_id $fid $access_token] status item_dict
+    if {$status eq "not_found"} {
+        lappend violations [dict create type not_found path $rel_path id $fid \
+            email "" expected "" actual "" detail "item id no longer resolves; folder deleted or id changed"]
+        return [list $violations {} {}]
+    } elseif {$status ne "ok"} {
+        lappend violations [dict create type error path $rel_path id $fid \
+            email "" expected "" actual "" detail "could not fetch item by id"]
+        return [list $violations {} {}]
+    }
+
+    # Drift: the id is authoritative, the path is the human label
+    set actual_path [item_actual_path $item_dict]
+    if {$actual_path ne "" && $actual_path ne $full_path} {
+        lappend violations [dict create type moved path $rel_path id $fid \
+            email "" expected "" actual "" \
+            detail "policy says '$full_path', actually at '$actual_path'"]
+    }
+
+    lassign [get_folder_permissions $fid $access_token] pstatus permissions
+    if {$pstatus ne "ok"} {
+        lappend violations [dict create type error path $rel_path id $fid \
+            email "" expected "" actual "" detail "could not read permissions"]
+        return [list $violations {} $item_dict]
+    }
+    set live [extract_users_from_permissions $permissions]
+
+    lassign [acl_diff [dict get $fentry expected] $live [dict get $fentry closed]] \
+        to_add to_fix to_remove extras
+    dict for {email role} $to_add {
+        lappend violations [dict create type missing_user path $rel_path id $fid \
+            email $email expected $role actual "" detail ""]
+    }
+    dict for {email fix} $to_fix {
+        lappend violations [dict create type wrong_role path $rel_path id $fid \
+            email $email expected [dict get $fix expected] actual [dict get $fix actual] detail ""]
+    }
+    dict for {email role} $to_remove {
+        lappend violations [dict create type extra_user path $rel_path id $fid \
+            email $email expected "" actual $role detail "closed collection"]
+    }
+    dict for {email role} $extras {
+        lappend violations [dict create type open_extra path $rel_path id $fid \
+            email $email expected "" actual $role detail "open collection, tolerated"]
+    }
+    return [list $violations $live $item_dict]
+}
+
+proc plan_ids_parents_first {plan} {
+    # Folder ids ordered by path depth so parent-level changes land before
+    # their descendants are examined
+    set with_depth {}
+    dict for {fid fentry} $plan {
+        set p [dict get $fentry path]
+        set depth [expr {$p eq "/" ? 0 : [llength [split $p "/"]]}]
+        lappend with_depth [list $depth $fid]
+    }
+    set ids {}
+    foreach pair [lsort -integer -index 0 $with_depth] {
+        lappend ids [lindex $pair 1]
+    }
+    return $ids
+}
+
+proc violation_is_informational {v} {
+    # open_extra is tolerated by policy; moved is advisory (id is
+    # authoritative); containment states leak-proneness, which the
+    # enforcement repair pass handles. None fails an audit.
+    return [expr {[dict get $v type] in {open_extra moved containment}}]
+}
+
+proc audit_print_report {violations people format} {
+    if {$format eq "csv"} {
+        puts "path,folder_id,violation_type,email,expected_role,actual_role,detail"
+        foreach v $violations {
+            set row {}
+            foreach field {path id type email expected actual detail} {
+                set val [dict get $v $field]
+                if {[string first "," $val] >= 0 || [string first "\"" $val] >= 0} {
+                    set val "\"[string map {\" \"\"} $val]\""
+                }
+                lappend row $val
+            }
+            puts [join $row ","]
+        }
+        return
+    }
+
+    set by_path {}
+    foreach v $violations {
+        dict lappend by_path [dict get $v path] $v
+    }
+    set real 0
+    set info 0
+    dict for {path vlist} $by_path {
+        puts "📁 $path"
+        foreach v $vlist {
+            set email [dict get $v email]
+            set who $email
+            if {$email ne "" && [dict exists $people $email name]} {
+                set who "$email ([dict get $people $email name])"
+            }
+            switch [dict get $v type] {
+                missing_user {
+                    puts "   ❌ MISSING $who (expected [dict get $v expected])"
+                    incr real
+                }
+                wrong_role {
+                    puts "   ❌ WRONG ROLE $who (expected [dict get $v expected], has [dict get $v actual])"
+                    incr real
+                }
+                extra_user {
+                    puts "   ❌ EXTRA $who (has [dict get $v actual]; [dict get $v detail])"
+                    incr real
+                }
+                open_extra {
+                    puts "   ℹ️  extra $who (has [dict get $v actual]; [dict get $v detail])"
+                    incr info
+                }
+                moved {
+                    puts "   ⚠️  MOVED: [dict get $v detail]"
+                    incr info
+                }
+                containment {
+                    puts "   ⚠️  LEAK-PRONE $who: [dict get $v detail]"
+                    incr info
+                }
+                not_found -
+                error {
+                    puts "   ❌ [string toupper [dict get $v type]]: [dict get $v detail]"
+                    incr real
+                }
+            }
+        }
+        puts ""
+    }
+    puts "Summary: $real violation(s), $info informational note(s)"
+}
+
+proc audit_cli {policy_path format remote_name} {
+    # Returns the process exit code: 0 clean, 1 violations, 2 policy error
+    global quiet_mode
+    set quiet_mode [expr {$format eq "csv"}]
+
+    if {[catch {policy_load $policy_path} model]} {
+        puts "❌ Policy error: $model"
+        return 2
+    }
+    set entity [dict get $model entity]
+    set plan [dict get $model plan]
+
+    if {!$quiet_mode} {
+        puts "🔍 Auditing [dict size $plan] folder(s) against $policy_path"
+        puts ""
+    }
+
+    set result [get_access_token $remote_name "" "detailed" 1]
+    set access_token [lindex $result 0]
+    if {$access_token eq ""} {
+        puts "❌ Failed to get access token"
+        return 2
+    }
+
+    set violations [policy_containment_violations $model]
+    foreach fid [plan_ids_parents_first $plan] {
+        lassign [audit_folder $fid [dict get $plan $fid] $entity $access_token] v _ _
+        lappend violations {*}$v
+    }
+
+    audit_print_report $violations [dict get $model people] $format
+
+    foreach v $violations {
+        if {![violation_is_informational $v]} {
+            return 1
+        }
+    }
+    return 0
+}
+
+proc enforce_remove_emails {fid emails access_token} {
+    # Remove every permission naming one of the emails on this folder,
+    # trying in place first: Graph refuses deletion of inherited permissions
+    # (inheritedFrom must be null), but probing keeps the tool correct the
+    # day Microsoft lifts that rule.
+    # Returns {removed_emails blocked_emails}: blocked = still inherited here
+    lassign [get_folder_permissions $fid $access_token] status permissions
+    if {$status ne "ok"} {
+        return [list {} $emails]
+    }
+    set removed {}
+    set blocked {}
+    foreach email $emails {
+        set done 0
+        set seen 0
+        foreach perm $permissions {
+            if {[is_owner_permission $perm]} { continue }
+            set match 0
+            foreach user_info [extract_users_from_perm $perm] {
+                if {[string tolower [lindex $user_info 1]] eq $email} {
+                    set match 1
+                    break
+                }
+            }
+            if {!$match} { continue }
+            set seen 1
+            lassign [remove_permission $fid [dict get $perm id] $access_token] rstatus rmsg
+            if {$rstatus eq "ok"} {
+                set done 1
+            }
+        }
+        if {$done} {
+            lappend removed $email
+        } elseif {$seen} {
+            lappend blocked $email
+        }
+    }
+    return [list $removed $blocked]
+}
+
+proc enforce_folder {fid fentry entity root_id access_token dry_run} {
+    # Bring one folder to its expected ACL.
+    # Returns {status changed_something violations_left} where status is
+    # ok | warning | error
+    lassign [audit_folder $fid $fentry $entity $access_token] violations live item_dict
+    set rel_path [dict get $fentry path]
+
+    set to_add {}
+    set to_fix {}
+    set to_remove {}
+    foreach v $violations {
+        switch [dict get $v type] {
+            missing_user { dict set to_add [dict get $v email] [dict get $v expected] }
+            wrong_role   { dict set to_fix [dict get $v email] [dict get $v expected] }
+            extra_user   { dict set to_remove [dict get $v email] [dict get $v actual] }
+            not_found -
+            error        { return [list error 0 $violations] }
+        }
+    }
+
+    if {[dict size $to_add] == 0 && [dict size $to_fix] == 0 && [dict size $to_remove] == 0} {
+        return [list ok 0 {}]
+    }
+
+    if {$dry_run} {
+        dict for {email role} $to_add { puts "  \[dry-run\] would invite $email ($role) to $rel_path" }
+        dict for {email role} $to_fix { puts "  \[dry-run\] would re-invite $email as $role on $rel_path" }
+        dict for {email role} $to_remove { puts "  \[dry-run\] would remove $email from $rel_path" }
+        return [list ok 0 {}]
+    }
+
+    set removal_emails [concat [dict keys $to_remove] [dict keys $to_fix]]
+    set moved 0
+    set original_parent ""
+
+    if {[llength $removal_emails] > 0} {
+        lassign [enforce_remove_emails $fid $removal_emails $access_token] removed blocked
+        foreach email $removed { puts "  ✂️  removed $email" }
+        if {[llength $blocked] > 0} {
+            # Inherited permissions survive in-place deletion: sever the
+            # inheritance by moving to the drive root, then delete there
+            puts "  🚚 inherited permissions on [join $blocked {, }]: moving folder to root to sever inheritance"
+            if {![dict exists $item_dict parentReference id]} {
+                return [list error 0 $violations]
+            }
+            set original_parent [dict get $item_dict parentReference id]
+            lassign [move_item $fid $root_id $access_token] mstatus mmsg
+            if {$mstatus ne "ok"} {
+                puts "  ❌ move failed: $mmsg"
+                return [list error 0 $violations]
+            }
+            set moved 1
+            after 2000
+            lassign [enforce_remove_emails $fid $blocked $access_token] removed2 blocked2
+            foreach email $removed2 { puts "  ✂️  removed $email (after move)" }
+            foreach email $blocked2 { puts "  ❌ still cannot remove $email" }
+        }
+    }
+
+    dict for {email role} $to_add {
+        lassign [invite_user_to_item $fid $email $role $access_token 1] istatus imsg
+        if {$istatus eq "ok"} {
+            puts "  ➕ invited $email ($role)"
+        } elseif {$istatus eq "ok-notified"} {
+            puts "  ➕ invited $email ($role); ⚠️ notification email was sent"
+        } else {
+            puts "  ❌ invite $email failed: $imsg"
+        }
+    }
+    dict for {email role} $to_fix {
+        lassign [invite_user_to_item $fid $email $role $access_token 1] istatus imsg
+        if {$istatus in {ok ok-notified}} {
+            puts "  🔁 re-invited $email as $role"
+        } else {
+            puts "  ❌ re-invite $email failed: $imsg"
+        }
+    }
+
+    if {$moved} {
+        lassign [move_item $fid $original_parent $access_token] mstatus mmsg
+        if {$mstatus ne "ok"} {
+            puts "  ❌ MOVE BACK FAILED: $mmsg  (folder is sitting at the drive root)"
+            return [list error 1 $violations]
+        }
+        after 2000
+    }
+
+    # Verify, allowing one settle-and-retry for propagation
+    foreach wait {0 3000} {
+        if {$wait > 0} { after $wait }
+        lassign [audit_folder $fid $fentry $entity $access_token] vleft _ _
+        set remaining {}
+        foreach v $vleft {
+            if {![violation_is_informational $v]} { lappend remaining $v }
+        }
+        if {[llength $remaining] == 0} {
+            puts "  ✅ verified"
+            return [list ok 1 {}]
+        }
+    }
+    puts "  ⚠️  still differs after enforcement"
+    return [list warning 1 $remaining]
+}
+
+proc enforce_cli {policy_path dry_run auto_yes remote_name} {
+    # Returns the process exit code: 0 clean, 1 residue, 2 policy error
+    if {[catch {policy_load $policy_path} model]} {
+        puts "❌ Policy error: $model"
+        return 2
+    }
+    set entity [dict get $model entity]
+    set plan [dict get $model plan]
+    set people [dict get $model people]
+
+    set access_token [cli_get_full_token $remote_name]
+    if {$access_token eq ""} {
+        return 2
+    }
+
+    # The drive root receives folders moved to sever inheritance
+    set root_result [cli_path_to_item_id_and_dict "/" $access_token]
+    if {[llength $root_result] == 0} {
+        return 2
+    }
+    set root_id [lindex $root_result 0]
+
+    # Show the whole plan before touching anything
+    puts "🔍 Auditing [dict size $plan] folder(s) against $policy_path"
+    puts ""
+    set violations [policy_containment_violations $model]
+    set dirty_ids {}
+    foreach fid [plan_ids_parents_first $plan] {
+        lassign [audit_folder $fid [dict get $plan $fid] $entity $access_token] v _ _
+        lappend violations {*}$v
+        foreach viol $v {
+            if {[dict get $viol type] in {missing_user wrong_role extra_user}} {
+                if {[lsearch -exact $dirty_ids $fid] < 0} { lappend dirty_ids $fid }
+            }
+        }
+    }
+    audit_print_report $violations $people text
+
+    if {[llength $dirty_ids] == 0} {
+        puts "Nothing to enforce."
+        foreach v $violations {
+            if {![violation_is_informational $v]} { return 1 }
+        }
+        return 0
+    }
+
+    if {$dry_run} {
+        puts "⚠️  DRY RUN MODE - No changes will be made"
+        puts ""
+    } elseif {!$auto_yes} {
+        puts -nonewline "Apply the fixes above to [llength $dirty_ids] folder(s)? \[Y/n\]: "
+        flush stdout
+        set answer [gets stdin]
+        if {$answer ne "" && [string tolower $answer] ne "y" && [string tolower $answer] ne "yes"} {
+            puts "Aborted."
+            return 1
+        }
+    }
+
+    set exit_code 0
+    set changed_paths {}
+    foreach fid $dirty_ids {
+        set fentry [dict get $plan $fid]
+        puts "📁 [dict get $fentry path]"
+        lassign [enforce_folder $fid $fentry $entity $root_id $access_token $dry_run] status changed _
+        if {$status ne "ok"} { set exit_code 1 }
+        if {$changed} { lappend changed_paths [dict get $fentry path] }
+        puts ""
+    }
+
+    if {$dry_run} {
+        return $exit_code
+    }
+
+    # Adding a user at a parent leaks an inherited copy into locked
+    # descendants (docs/INHERITANCE-LEAKING-IN-LOCKED-FOLDERS.md); one
+    # repair pass over closed folders below any changed folder
+    set repair_ids {}
+    dict for {fid fentry} $plan {
+        if {![dict get $fentry closed]} { continue }
+        set fpath [dict get $fentry path]
+        foreach cpath $changed_paths {
+            if {$cpath eq "/" || [string match "$cpath/*" $fpath]} {
+                if {[lsearch -exact $repair_ids $fid] < 0} { lappend repair_ids $fid }
+                break
+            }
+        }
+    }
+    if {[llength $repair_ids] > 0} {
+        puts "🔁 Re-checking [llength $repair_ids] closed folder(s) below changed parents for leaked permissions"
+        foreach fid $repair_ids {
+            set fentry [dict get $plan $fid]
+            puts "📁 [dict get $fentry path]"
+            lassign [enforce_folder $fid $fentry $entity $root_id $access_token 0] status _ _
+            if {$status ne "ok"} { set exit_code 1 }
+            puts ""
+        }
+    }
+
+    if {$exit_code == 0} {
+        puts "✅ Enforcement complete; drive matches the policy."
+    } else {
+        puts "⚠️  Enforcement finished with residue; re-run --audit for the current state."
+    }
+    return $exit_code
+}
+
 proc main {argc argv} {
     # CLI mode - process command line arguments with path-first interface
     # Usage: [PATH] [OPTIONS]
@@ -3885,6 +4657,8 @@ proc main {argc argv} {
         {remove-user.arg "" "Remove USER's access (destructive)"}
         {invite.arg "" "Invite USER with read/write access (inherited by children)"}
         {set-caption.arg "\x00" "Set the item's caption/description (searchable in OneDrive); use \"\" to clear"}
+        {audit.arg "" "Audit live ACLs against a POLICY yaml file (read-only)"}
+        {enforce.arg "" "Audit then fix live ACLs to match a POLICY yaml file"}
         {r "Include children in scan (recursive, default depth: 3)"}
         {recursive "Include children in scan (recursive, default depth: 3)"}
         {max-depth.arg "0" "Max depth (default: 3 with -r, 0 otherwise)"}
@@ -3921,6 +4695,8 @@ proc main {argc argv} {
     set remove_user $params(remove-user)
     set invite_user $params(invite)
     set caption $params(set-caption)
+    set audit_policy $params(audit)
+    set enforce_policy $params(enforce)
     set item_type $params(type)
     set output_format $params(format)
     set dry_run $params(dry-run)
@@ -3950,10 +4726,24 @@ proc main {argc argv} {
     if {$remove_user ne ""} { incr action_count }
     if {$invite_user ne ""} { incr action_count }
     if {$caption ne "\x00"} { incr action_count }
+    if {$audit_policy ne ""} { incr action_count }
+    if {$enforce_policy ne ""} { incr action_count }
 
     if {$action_count > 1} {
-        puts "Error: --only-user, --remove-user, --invite, and --set-caption are mutually exclusive"
+        puts "Error: --only-user, --remove-user, --invite, --set-caption, --audit, and --enforce are mutually exclusive"
         exit 1
+    }
+
+    # Policy modes take their folder set from the policy file
+    if {($audit_policy ne "" || $enforce_policy ne "")} {
+        if {$r_flag_used || $max_depth_explicit} {
+            puts "Error: --audit/--enforce cannot be used with -r or --max-depth (the policy defines the folder set)"
+            exit 1
+        }
+        if {$path ne ""} {
+            puts "Error: --audit/--enforce take no PATH argument (the policy defines the folder set)"
+            exit 1
+        }
     }
     
     # Validate --invite is not used with recursive flags
@@ -3968,9 +4758,9 @@ proc main {argc argv} {
         exit 1
     }
     
-    # Validate --dry-run only with --remove-user
-    if {$dry_run && $remove_user eq ""} {
-        puts "Error: --dry-run can only be used with --remove-user"
+    # Validate --dry-run only with --remove-user or --enforce
+    if {$dry_run && $remove_user eq "" && $enforce_policy eq ""} {
+        puts "Error: --dry-run can only be used with --remove-user or --enforce"
         exit 1
     }
     
@@ -3992,15 +4782,15 @@ proc main {argc argv} {
         exit 1
     }
 
-    # Validate --format csv only with default ACL display mode
-    if {$output_format eq "csv" && ($only_user ne "" || $remove_user ne "" || $invite_user ne "")} {
-        puts "Error: --format csv can only be used with default ACL display mode"
+    # Validate --format csv only with default ACL display mode or --audit
+    if {$output_format eq "csv" && ($only_user ne "" || $remove_user ne "" || $invite_user ne "" || $enforce_policy ne "")} {
+        puts "Error: --format csv can only be used with default ACL display mode or --audit"
         exit 1
     }
 
-    # Validate --yes only with --remove-user
-    if {$auto_yes && $remove_user eq ""} {
-        puts "Error: --yes can only be used with --remove-user"
+    # Validate --yes only with --remove-user or --enforce
+    if {$auto_yes && $remove_user eq "" && $enforce_policy eq ""} {
+        puts "Error: --yes can only be used with --remove-user or --enforce"
         exit 1
     }
 
@@ -4011,7 +4801,13 @@ proc main {argc argv} {
     }
     
     # Execute based on flags
-    if {$invite_user ne ""} {
+    if {$audit_policy ne ""} {
+        exit [audit_cli $audit_policy $output_format $remote_name]
+
+    } elseif {$enforce_policy ne ""} {
+        exit [enforce_cli $enforce_policy $dry_run $auto_yes $remote_name]
+
+    } elseif {$invite_user ne ""} {
         # Invite user to path
         puts "📧 Inviting user to path: $path"
         puts "User: $invite_user"
