@@ -107,6 +107,14 @@ People forget permissions: they share a folder mid-task, staff leave, folders mo
 
 Folder paths run from the drive root, so one policy file covers every top-level folder on a drive. A drive holding several companies' folders is governed by one file, and a folder outside every collection is simply not audited.
 
+To get the item ids for a new collection, list the folder with rclone:
+
+```bash
+rclone lsjson "OneDrive:Some Folder" --dirs-only | jq -r '.[] | [.ID, .Name] | @tsv'
+```
+
+rclone prints the id as `<drive>#<item>`; the policy file takes the part after the `#`.
+
 A grant reaches descendants through OneDrive inheritance, so a folder's entitlements are its own grants plus its policy ancestors'. A collection marked `closed: true` is the exception: its folders admit exactly their own grants, and anything beyond, direct or inherited, is a violation. `--audit` reports violations folder by folder (`--format csv` for machines) and exits nonzero on any; `--enforce` invites missing users quietly (no notification email), downgrades or removes wrong ones, and handles inherited permissions with the move-to-root cycle described in `docs/PHANTOM-INHERITANCE-BUG.md`, re-checking descendants of changed folders for leaked copies afterwards.
 
 ## Scheduled audits
