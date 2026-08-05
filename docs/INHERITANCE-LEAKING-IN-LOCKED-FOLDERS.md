@@ -31,7 +31,10 @@ Every time a new user is added at the top level, **all locked subfolders must be
 
 1. Move locked subfolder to OneDrive root
 2. Remove the leaked inherited user
-3. Move folder back to original location
+3. Re-plant the folder's desired ACL as explicit permissions while it sits at the root (a folder returned to a shared tree without its own permission scope re-inherits the parent's set wholesale; see PHANTOM-INHERITANCE-BUG.md, retest 2026-08-05)
+4. Move folder back to original location
+
+`acl-manager.tcl --enforce` performs this cycle automatically for policy folders.
 
 ### Example
 

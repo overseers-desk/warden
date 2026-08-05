@@ -3968,10 +3968,14 @@ proc gui_fetch_acl {item_id remote_name} {
 # ============================================================================
 # A policy YAML file declares desired sharing state: groups (people),
 # collections (folder sets addressed by stable item id), and grants joining
-# the two. A folder's expected ACL is the union of grants over every
-# collection containing it, write beating read. closed: true on a collection
-# makes any live permission beyond the expected set a violation; on open
-# collections extras are reported but tolerated. Owner permissions are out of
+# the two. A grant binds at the folders of its collection ("bound" ACL,
+# write beating read) and reaches descendants through OneDrive inheritance,
+# so a folder's "effective" ACL is the union of bound ACLs over itself and
+# every policy ancestor. Live direct permissions are judged against the
+# folder's own entitlements; live inherited permissions are judged at their
+# source, so only inherited access exceeding the effective ACL is flagged
+# here. closed: true on a collection makes excess a violation; on open
+# collections it is reported but tolerated. Owner permissions are out of
 # scope on both sides.
 
 proc policy_member_email {member} {
@@ -4137,68 +4141,27 @@ proc policy_load {yaml_path} {
         }
     }
 
-    return [dict create entity $entity people $people plan $plan]
-}
-
-proc policy_containment_violations {model} {
-    # A closed folder under a more broadly granted ancestor is leak-prone:
-    # OneDrive has no deny, and a user newly added at the ancestor
-    # propagates into the child as an inherited permission until the next
-    # enforcement repair pass (docs/INHERITANCE-LEAKING-IN-LOCKED-FOLDERS.md).
-    # Advisory: flags any policy ancestor whose expected users exceed the
-    # closed child's (or hold write where the child grants read).
-    set plan [dict get $model plan]
-    set violations {}
+    # Effective ACL: what a user may hold at this folder from any source —
+    # the folder's own grants plus every policy ancestor's (OneDrive
+    # inheritance carries ancestor grants down), write beating read
     dict for {fid fentry} $plan {
-        if {![dict get $fentry closed]} { continue }
-        set child_path [dict get $fentry path]
-        set child_expected [dict get $fentry expected]
+        set fpath [dict get $fentry path]
+        set effective [dict get $fentry expected]
         dict for {aid aentry} $plan {
             if {$aid eq $fid} { continue }
             set apath [dict get $aentry path]
-            if {$apath eq "/" || [string match "$apath/*" $child_path]} {
+            if {$apath eq "/" || [string match "$apath/*" $fpath]} {
                 dict for {email role} [dict get $aentry expected] {
-                    set ok [expr {[dict exists $child_expected $email] && \
-                        ([dict get $child_expected $email] eq "write" || $role eq "read")}]
-                    if {!$ok} {
-                        lappend violations [dict create \
-                            type containment path $child_path id $fid email $email \
-                            expected "" actual $role \
-                            detail "granted on ancestor '$apath' but not on this closed folder"]
+                    if {![dict exists $effective $email] || [dict get $effective $email] ne "write"} {
+                        dict set effective $email $role
                     }
                 }
             }
         }
+        dict set plan $fid effective $effective
     }
-    return $violations
-}
 
-proc acl_diff {expected live closed} {
-    # Diff desired vs live email->role dicts.
-    # Returns {to_add to_fix to_remove extras}: to_add email->role,
-    # to_fix email->{expected actual}, to_remove email->role (closed only),
-    # extras email->role (open collections, tolerated).
-    set to_add {}
-    set to_fix {}
-    set to_remove {}
-    set extras {}
-    dict for {email role} $expected {
-        if {![dict exists $live $email]} {
-            dict set to_add $email $role
-        } elseif {[dict get $live $email] ne $role} {
-            dict set to_fix $email [dict create expected $role actual [dict get $live $email]]
-        }
-    }
-    dict for {email role} $live {
-        if {![dict exists $expected $email]} {
-            if {$closed} {
-                dict set to_remove $email $role
-            } else {
-                dict set extras $email $role
-            }
-        }
-    }
-    return [list $to_add $to_fix $to_remove $extras]
+    return [dict create entity $entity people $people plan $plan]
 }
 
 proc policy_full_path {entity rel_path} {
@@ -4242,27 +4205,72 @@ proc audit_folder {fid fentry entity access_token} {
             email "" expected "" actual "" detail "could not read permissions"]
         return [list $violations {} $item_dict]
     }
-    set live [extract_users_from_permissions $permissions]
 
-    lassign [acl_diff [dict get $fentry expected] $live [dict get $fentry closed]] \
-        to_add to_fix to_remove extras
-    dict for {email role} $to_add {
-        lappend violations [dict create type missing_user path $rel_path id $fid \
-            email $email expected $role actual "" detail ""]
+    set direct_perms {}
+    set inherited_perms {}
+    foreach perm $permissions {
+        if {[is_owner_permission $perm]} { continue }
+        if {[is_inherited_permission $perm]} {
+            lappend inherited_perms $perm
+        } else {
+            lappend direct_perms $perm
+        }
     }
-    dict for {email fix} $to_fix {
-        lappend violations [dict create type wrong_role path $rel_path id $fid \
-            email $email expected [dict get $fix expected] actual [dict get $fix actual] detail ""]
+    set live_direct [extract_users_from_permissions $direct_perms]
+    set live_inherited [extract_users_from_permissions $inherited_perms]
+    set live_all [extract_users_from_permissions $permissions]
+
+    set bound [dict get $fentry expected]
+    set effective [dict get $fentry effective]
+    set closed [dict get $fentry closed]
+
+    # Grants binding here must be satisfied here (inherited access counts)
+    dict for {email role} $bound {
+        if {![dict exists $live_all $email]} {
+            lappend violations [dict create type missing_user path $rel_path id $fid \
+                email $email expected $role actual "" detail ""]
+        } elseif {$role eq "write" && [dict get $live_all $email] ne "write"} {
+            lappend violations [dict create type missing_user path $rel_path id $fid \
+                email $email expected $role actual [dict get $live_all $email] \
+                detail "holds read only; a direct write invite raises it"]
+        }
     }
-    dict for {email role} $to_remove {
-        lappend violations [dict create type extra_user path $rel_path id $fid \
-            email $email expected "" actual $role detail "closed collection"]
+
+    # Direct permissions answer to this folder's entitlements
+    dict for {email drole} $live_direct {
+        if {[dict exists $bound $email] && [dict get $bound $email] eq $drole} { continue }
+        if {[dict exists $effective $email]} {
+            set erole [dict get $effective $email]
+            if {$drole eq $erole || $erole eq "write"} { continue }
+            lappend violations [dict create type wrong_role path $rel_path id $fid \
+                email $email expected $erole actual $drole detail "direct permission exceeds entitlement"]
+        } elseif {$closed} {
+            lappend violations [dict create type extra_user path $rel_path id $fid \
+                email $email expected "" actual $drole detail "closed collection"]
+        } else {
+            lappend violations [dict create type open_extra path $rel_path id $fid \
+                email $email expected "" actual $drole detail "open collection, tolerated"]
+        }
     }
-    dict for {email role} $extras {
-        lappend violations [dict create type open_extra path $rel_path id $fid \
-            email $email expected "" actual $role detail "open collection, tolerated"]
+
+    # Inherited permissions are fixed at their source folder; flagged here
+    # only when they exceed what any source could legitimately confer
+    dict for {email irole} $live_inherited {
+        set ok [expr {[dict exists $effective $email] && \
+            ([dict get $effective $email] eq "write" || $irole eq "read")}]
+        if {$ok} { continue }
+        if {$closed} {
+            lappend violations [dict create type leaked_inherited path $rel_path id $fid \
+                email $email expected "" actual $irole \
+                detail "inherited access beyond entitlement; removal severs inheritance"]
+        } else {
+            lappend violations [dict create type open_inherited path $rel_path id $fid \
+                email $email expected "" actual $irole \
+                detail "inherited access beyond entitlement on open collection, tolerated"]
+        }
     }
-    return [list $violations $live $item_dict]
+
+    return [list $violations $live_all $item_dict]
 }
 
 proc plan_ids_parents_first {plan} {
@@ -4282,10 +4290,9 @@ proc plan_ids_parents_first {plan} {
 }
 
 proc violation_is_informational {v} {
-    # open_extra is tolerated by policy; moved is advisory (id is
-    # authoritative); containment states leak-proneness, which the
-    # enforcement repair pass handles. None fails an audit.
-    return [expr {[dict get $v type] in {open_extra moved containment}}]
+    # Tolerated-by-policy excess on open collections and the moved
+    # advisory (id is authoritative) do not fail an audit
+    return [expr {[dict get $v type] in {open_extra open_inherited moved}}]
 }
 
 proc audit_print_report {violations people format} {
@@ -4332,16 +4339,20 @@ proc audit_print_report {violations people format} {
                     puts "   ❌ EXTRA $who (has [dict get $v actual]; [dict get $v detail])"
                     incr real
                 }
+                leaked_inherited {
+                    puts "   ❌ LEAKED $who (inherited [dict get $v actual]; [dict get $v detail])"
+                    incr real
+                }
                 open_extra {
                     puts "   ℹ️  extra $who (has [dict get $v actual]; [dict get $v detail])"
                     incr info
                 }
-                moved {
-                    puts "   ⚠️  MOVED: [dict get $v detail]"
+                open_inherited {
+                    puts "   ℹ️  inherited extra $who ([dict get $v actual]; [dict get $v detail])"
                     incr info
                 }
-                containment {
-                    puts "   ⚠️  LEAK-PRONE $who: [dict get $v detail]"
+                moved {
+                    puts "   ⚠️  MOVED: [dict get $v detail]"
                     incr info
                 }
                 not_found -
@@ -4380,7 +4391,7 @@ proc audit_cli {policy_path format remote_name} {
         return 2
     }
 
-    set violations [policy_containment_violations $model]
+    set violations {}
     foreach fid [plan_ids_parents_first $plan] {
         lassign [audit_folder $fid [dict get $plan $fid] $entity $access_token] v _ _
         lappend violations {*}$v
@@ -4448,11 +4459,12 @@ proc enforce_folder {fid fentry entity root_id access_token dry_run} {
     set to_remove {}
     foreach v $violations {
         switch [dict get $v type] {
-            missing_user { dict set to_add [dict get $v email] [dict get $v expected] }
-            wrong_role   { dict set to_fix [dict get $v email] [dict get $v expected] }
-            extra_user   { dict set to_remove [dict get $v email] [dict get $v actual] }
+            missing_user      { dict set to_add [dict get $v email] [dict get $v expected] }
+            wrong_role        { dict set to_fix [dict get $v email] [dict get $v expected] }
+            extra_user -
+            leaked_inherited  { dict set to_remove [dict get $v email] [dict get $v actual] }
             not_found -
-            error        { return [list error 0 $violations] }
+            error             { return [list error 0 $violations] }
         }
     }
 
@@ -4475,8 +4487,13 @@ proc enforce_folder {fid fentry entity root_id access_token dry_run} {
         lassign [enforce_remove_emails $fid $removal_emails $access_token] removed blocked
         foreach email $removed { puts "  ✂️  removed $email" }
         if {[llength $blocked] > 0} {
-            # Inherited permissions survive in-place deletion: sever the
-            # inheritance by moving to the drive root, then delete there
+            # Live inherited permissions resist in-place deletion. At the
+            # drive root they detach entirely, and a folder returned to a
+            # shared tree re-attaches to the parent's inheritance unless it
+            # carries its own permission scope. So: move out, delete
+            # whatever explicit residue names the blocked users, plant the
+            # folder's full effective ACL as explicit permissions, and only
+            # then move back.
             puts "  🚚 inherited permissions on [join $blocked {, }]: moving folder to root to sever inheritance"
             if {![dict exists $item_dict parentReference id]} {
                 return [list error 0 $violations]
@@ -4495,32 +4512,52 @@ proc enforce_folder {fid fentry entity root_id access_token dry_run} {
         }
     }
 
-    dict for {email role} $to_add {
-        lassign [invite_user_to_item $fid $email $role $access_token 1] istatus imsg
-        if {$istatus eq "ok"} {
-            puts "  ➕ invited $email ($role)"
-        } elseif {$istatus eq "ok-notified"} {
-            puts "  ➕ invited $email ($role); ⚠️ notification email was sent"
-        } else {
-            puts "  ❌ invite $email failed: $imsg"
-        }
-    }
-    dict for {email role} $to_fix {
-        lassign [invite_user_to_item $fid $email $role $access_token 1] istatus imsg
-        if {$istatus in {ok ok-notified}} {
-            puts "  🔁 re-invited $email as $role"
-        } else {
-            puts "  ❌ re-invite $email failed: $imsg"
-        }
-    }
-
     if {$moved} {
+        # Plant the effective ACL while inheritance is severed; the
+        # explicit scope keeps the folder from re-inheriting on return
+        lassign [get_folder_permissions $fid $access_token] pstatus perms_now
+        if {$pstatus ne "ok"} {
+            puts "  ❌ cannot read permissions at root; leaving folder in place"
+        } else {
+            set live_now [extract_users_from_permissions $perms_now]
+            dict for {email role} [dict get $fentry effective] {
+                if {[dict exists $live_now $email] && \
+                    ([dict get $live_now $email] eq $role || [dict get $live_now $email] eq "write")} { continue }
+                lassign [invite_user_to_item $fid $email $role $access_token 1] istatus imsg
+                if {$istatus eq "ok"} {
+                    puts "  🌱 planted $email ($role)"
+                } elseif {$istatus eq "ok-notified"} {
+                    puts "  🌱 planted $email ($role); ⚠️ notification email was sent"
+                } else {
+                    puts "  ❌ plant $email failed: $imsg"
+                }
+            }
+        }
         lassign [move_item $fid $original_parent $access_token] mstatus mmsg
         if {$mstatus ne "ok"} {
             puts "  ❌ MOVE BACK FAILED: $mmsg  (folder is sitting at the drive root)"
             return [list error 1 $violations]
         }
         after 2000
+    } else {
+        dict for {email role} $to_add {
+            lassign [invite_user_to_item $fid $email $role $access_token 1] istatus imsg
+            if {$istatus eq "ok"} {
+                puts "  ➕ invited $email ($role)"
+            } elseif {$istatus eq "ok-notified"} {
+                puts "  ➕ invited $email ($role); ⚠️ notification email was sent"
+            } else {
+                puts "  ❌ invite $email failed: $imsg"
+            }
+        }
+        dict for {email role} $to_fix {
+            lassign [invite_user_to_item $fid $email $role $access_token 1] istatus imsg
+            if {$istatus in {ok ok-notified}} {
+                puts "  🔁 re-invited $email as $role"
+            } else {
+                puts "  ❌ re-invite $email failed: $imsg"
+            }
+        }
     }
 
     # Verify, allowing one settle-and-retry for propagation
@@ -4565,13 +4602,13 @@ proc enforce_cli {policy_path dry_run auto_yes remote_name} {
     # Show the whole plan before touching anything
     puts "🔍 Auditing [dict size $plan] folder(s) against $policy_path"
     puts ""
-    set violations [policy_containment_violations $model]
+    set violations {}
     set dirty_ids {}
     foreach fid [plan_ids_parents_first $plan] {
         lassign [audit_folder $fid [dict get $plan $fid] $entity $access_token] v _ _
         lappend violations {*}$v
         foreach viol $v {
-            if {[dict get $viol type] in {missing_user wrong_role extra_user}} {
+            if {[dict get $viol type] in {missing_user wrong_role extra_user leaked_inherited}} {
                 if {[lsearch -exact $dirty_ids $fid] < 0} { lappend dirty_ids $fid }
             }
         }
@@ -4614,14 +4651,16 @@ proc enforce_cli {policy_path dry_run auto_yes remote_name} {
         return $exit_code
     }
 
-    # Adding a user at a parent leaks an inherited copy into locked
-    # descendants (docs/INHERITANCE-LEAKING-IN-LOCKED-FOLDERS.md); one
-    # repair pass over closed folders below any changed folder
+    # A change at a parent cascades: an added user leaks an inherited copy
+    # into locked descendants (docs/INHERITANCE-LEAKING-IN-LOCKED-FOLDERS.md),
+    # and a role downgrade at a parent can strip a descendant's team below
+    # its own grant. One repair pass over every policy folder below a
+    # changed one.
     set repair_ids {}
     dict for {fid fentry} $plan {
-        if {![dict get $fentry closed]} { continue }
         set fpath [dict get $fentry path]
         foreach cpath $changed_paths {
+            if {$cpath eq $fpath} { continue }
             if {$cpath eq "/" || [string match "$cpath/*" $fpath]} {
                 if {[lsearch -exact $repair_ids $fid] < 0} { lappend repair_ids $fid }
                 break
@@ -4629,7 +4668,7 @@ proc enforce_cli {policy_path dry_run auto_yes remote_name} {
         }
     }
     if {[llength $repair_ids] > 0} {
-        puts "🔁 Re-checking [llength $repair_ids] closed folder(s) below changed parents for leaked permissions"
+        puts "🔁 Re-checking [llength $repair_ids] folder(s) below changed parents for cascade effects"
         foreach fid $repair_ids {
             set fentry [dict get $plan $fid]
             puts "📁 [dict get $fentry path]"

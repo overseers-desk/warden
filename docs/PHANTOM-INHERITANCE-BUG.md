@@ -121,30 +121,34 @@ Result: Tool reports "does not have explicit access" but user still has access t
 
 ## The Workaround
 
-### Procedure
+### Procedure (move, edit, plant, return)
 
-1. **Move folder to root**
-   - Use OneDrive web UI or Microsoft Graph API
-   - Move the problematic folder to OneDrive root level
+1. **Move folder to OneDrive root** (web UI, Graph PATCH parentReference, or
+   `--enforce` which does all of this automatically)
 
-2. **Remove user permission**
-   - Permission is now "unique" (not inherited)
-   - Can be removed using `--remove-user`:
-   ```bash
-   ./acl-manager.tcl --remove-user user@example.com "FolderName"
-   ```
+2. **Delete unwanted permissions** — phantom-inherited entries materialize as
+   unique and become deletable; entries inherited from a live shared ancestor
+   detach entirely at the root, leaving nothing to delete
 
-3. **Move folder back**
-   - Return folder to original location
-   - User will NOT re-appear (inheritance link is broken)
+3. **Plant the desired ACL as explicit permissions while still at the root.**
+   This step is what makes the restriction survive the return trip: a folder
+   moved back into a shared tree re-attaches to the parent's inheritance
+   unless it carries its own permission scope. (Retested 2026-08-05: a
+   folder moved back without planting re-inherited the parent's full set,
+   including entries whose in-place deletion had reported success.)
+
+4. **Move folder back** — the explicit scope holds; removed users do not
+   re-appear
 
 ### Why This Works
 
-Moving the folder to root **severs the phantom inheritance scope link**:
-- Inherited permissions become unique/explicit permissions
-- Once unique, they can be deleted via Graph API
-- When moved back, folder maintains its new permission set
-- No longer connected to phantom scope
+Moving the folder to root detaches it from every inheritance source:
+- Phantom-scope permissions materialize as unique and can be deleted
+- Live-inherited permissions vanish while the folder sits at the root
+- Explicit permissions planted at the root form the folder's own security
+  scope, which OneDrive keeps when the folder returns to the shared tree
+- Without a planted scope, the returned folder re-inherits from its parent
+  wholesale, undoing every deletion
 
 ### Alternative: Manual via Web UI
 
@@ -249,12 +253,35 @@ If you see "does not have explicit access" but user shows up in folder ACL, you 
 - [Clarifying The Security Scope Limits In SharePoint Lists](https://reality-tech.com/blog/clarifying-the-security-scope-limits-in-sharepoint-lists/)
 - [Permission scopes in SharePoint Web Services](https://thomask.sdf.org/blog/2017/12/16/permission-scopes-sharepoint-web-services.html)
 
+## Retest 2026-08-05 (live inheritance)
+
+Retested against a scratch folder freshly created inside a locked folder,
+whose permissions were inherited from live ancestors rather than a phantom
+scope:
+
+- In-place `DELETE` of a permission inherited from a live shared ancestor:
+  **403 accessDenied** — the restriction is still in force.
+- In-place `DELETE` of an inherited copy of a *leaked* (phantom-sourced)
+  entry returns success, but the entry reappears after a move cycle: the
+  deletion is transient.
+- At the drive root, live-inherited permissions **detach entirely** rather
+  than becoming unique (the 2024 became-unique observation applies to
+  phantom-scope entries).
+- Move-back **re-attaches parent inheritance** unless explicit permissions
+  were planted at the root; with a planted scope the restriction sticks and
+  a fresh audit verifies clean.
+- `sendInvitation:false` on the invite endpoint is **accepted** by consumer
+  OneDrive (HTTP 200), enabling quiet permission planting.
+
 ## Summary
 
 This is an **undocumented OneDrive/SharePoint permission sync bug** where:
 - Child folders can inherit from deleted/phantom security scopes
 - Permissions appear as "inherited" from non-existent sources
 - Graph API blocks deletion of these phantom inherited permissions
-- Moving folder to root is the only known workaround
+- Move to root, delete, **plant the desired ACL explicitly**, move back is
+  the only known workaround
 
-The move-to-root workaround was discovered through experimentation and successfully tested on 2024-11-22.
+The move-to-root workaround was discovered through experimentation and
+successfully tested on 2024-11-22; the planting requirement for folders
+under live shared ancestors was established on 2026-08-05.
