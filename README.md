@@ -53,7 +53,9 @@ tclsh acl-manager.tcl [OPTIONS] [PATH]
 - `--only-user USER` - show only what USER can access (with or without `-r`)
 - `--remove-user USER` - remove USER's access from what's found; destructive, needs `-r` or an explicit depth
 - `--invite USER` - invite USER with read/write, inherited by children; not usable with `-r`
-- `--dry-run` - preview a `--remove-user` without changing anything
+- `--audit POLICY` - compare live ACLs against a policy file (read-only; see below)
+- `--enforce POLICY` - audit, then fix the drive to match the policy
+- `--dry-run` - preview a `--remove-user` or `--enforce` without changing anything
 - `--read-only` - invite with read-only instead of read/write
 - `--debug` - debug output
 - `--remote REMOTE` - OneDrive remote name (default `OneDrive`)
@@ -90,9 +92,20 @@ tclsh acl-manager.tcl --invite newaccountant@example.com "Finance"
 # ...read-only
 tclsh acl-manager.tcl --invite auditor@example.com --read-only "Reports"
 
+# Audit the drive against a policy file, then apply the fixes
+tclsh acl-manager.tcl --audit acl-policy.yaml
+tclsh acl-manager.tcl --enforce acl-policy.yaml --dry-run
+tclsh acl-manager.tcl --enforce acl-policy.yaml
+
 # GUI for interactive browsing
 wish acl-manager.tcl "Finance"
 ```
+
+## Policy files
+
+People forget permissions: they share a folder mid-task, staff leave, folders move, and nobody notices until data has leaked. A policy file turns the intended sharing state into data the tool can check and restore. It is YAML with three sections: `groups` name people once (each member records email, name, contractual relationship, and why they have access), `collections` name folder sets by path plus stable item id (the id survives renames and moves, which is how drift is caught), and `grants` join a group to a collection with a role (`read` or `write`).
+
+A grant reaches descendants through OneDrive inheritance, so a folder's entitlements are its own grants plus its policy ancestors'. A collection marked `closed: true` is the exception: its folders admit exactly their own grants, and anything beyond, direct or inherited, is a violation. `--audit` reports violations folder by folder (`--format csv` for machines) and exits nonzero on any; `--enforce` invites missing users quietly (no notification email), downgrades or removes wrong ones, and handles inherited permissions with the move-to-root cycle described in `docs/PHANTOM-INHERITANCE-BUG.md`, re-checking descendants of changed folders for leaked copies afterwards.
 
 ## Permissions and tokens
 
