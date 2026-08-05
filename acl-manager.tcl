@@ -4065,7 +4065,6 @@ proc policy_resolve_collection {collections name chain} {
 
 proc policy_load {yaml_path} {
     # Load and validate a policy file into the model the audit runs on:
-    #   entity  - root folder name paths are relative to
     #   people  - email -> {name relationship reason} (for reporting)
     #   plan    - folder id -> {path closed expected} with expected an
     #             email -> role dict
@@ -4076,12 +4075,11 @@ proc policy_load {yaml_path} {
     close $f
 
     set policy [yaml::yaml2dict $yaml_text]
-    foreach key {entity groups collections grants} {
+    foreach key {groups collections grants} {
         if {![dict exists $policy $key]} {
             error "policy is missing its '$key' section"
         }
     }
-    set entity [dict get $policy entity]
     set groups [dict get $policy groups]
     set collections [dict get $policy collections]
 
@@ -4185,24 +4183,16 @@ proc policy_load {yaml_path} {
         dict set plan $fid effective $effective
     }
 
-    return [dict create entity $entity people $people plan $plan]
+    return [dict create people $people plan $plan]
 }
 
-proc policy_full_path {entity rel_path} {
-    # Policy folder paths are relative to the entity; "/" is the entity itself
-    if {$rel_path eq "/" || $rel_path eq ""} {
-        return $entity
-    }
-    return "$entity/$rel_path"
-}
-
-proc audit_folder {fid fentry entity access_token} {
+proc audit_folder {fid fentry access_token} {
     # Audit one policy folder against the live drive.
     # Returns {violations live_dict item_dict}; live_dict/item_dict are {} when
     # the folder id no longer resolves.
     set violations {}
     set rel_path [dict get $fentry path]
-    set full_path [policy_full_path $entity $rel_path]
+    set full_path $rel_path
 
     lassign [get_item_by_id $fid $access_token] status item_dict
     if {$status eq "not_found"} {
@@ -4400,7 +4390,6 @@ proc audit_cli {policy_path format remote_name} {
         puts "❌ Policy error: $model"
         return 2
     }
-    set entity [dict get $model entity]
     set plan [dict get $model plan]
 
     if {!$quiet_mode} {
@@ -4417,7 +4406,7 @@ proc audit_cli {policy_path format remote_name} {
 
     set violations {}
     foreach fid [plan_ids_parents_first $plan] {
-        lassign [audit_folder $fid [dict get $plan $fid] $entity $access_token] v _ _
+        lassign [audit_folder $fid [dict get $plan $fid] $access_token] v _ _
         lappend violations {*}$v
     }
 
@@ -4491,11 +4480,11 @@ proc enforce_remove_emails {fid emails access_token} {
     return [list $removed $blocked]
 }
 
-proc enforce_folder {fid fentry entity root_id access_token dry_run} {
+proc enforce_folder {fid fentry root_id access_token dry_run} {
     # Bring one folder to its expected ACL.
     # Returns {status changed_something violations_left} where status is
     # ok | warning | error
-    lassign [audit_folder $fid $fentry $entity $access_token] violations live item_dict
+    lassign [audit_folder $fid $fentry $access_token] violations live item_dict
     set rel_path [dict get $fentry path]
 
     set to_add {}
@@ -4607,7 +4596,7 @@ proc enforce_folder {fid fentry entity root_id access_token dry_run} {
     # Verify, allowing one settle-and-retry for propagation
     foreach wait {0 3000} {
         if {$wait > 0} { after $wait }
-        lassign [audit_folder $fid $fentry $entity $access_token] vleft _ _
+        lassign [audit_folder $fid $fentry $access_token] vleft _ _
         set remaining {}
         foreach v $vleft {
             if {![violation_is_informational $v]} { lappend remaining $v }
@@ -4627,7 +4616,6 @@ proc enforce_cli {policy_path dry_run auto_yes remote_name} {
         puts "❌ Policy error: $model"
         return 2
     }
-    set entity [dict get $model entity]
     set plan [dict get $model plan]
     set people [dict get $model people]
 
@@ -4650,7 +4638,7 @@ proc enforce_cli {policy_path dry_run auto_yes remote_name} {
     set dirty_ids {}
     set audit_errors 0
     foreach fid [plan_ids_parents_first $plan] {
-        lassign [audit_folder $fid [dict get $plan $fid] $entity $access_token] v _ _
+        lassign [audit_folder $fid [dict get $plan $fid] $access_token] v _ _
         lappend violations {*}$v
         foreach viol $v {
             if {[dict get $viol type] in {missing_user wrong_role extra_user leaked_inherited}} {
@@ -4688,7 +4676,7 @@ proc enforce_cli {policy_path dry_run auto_yes remote_name} {
     foreach fid $dirty_ids {
         set fentry [dict get $plan $fid]
         puts "📁 [dict get $fentry path]"
-        lassign [enforce_folder $fid $fentry $entity $root_id $access_token $dry_run] status changed _
+        lassign [enforce_folder $fid $fentry $root_id $access_token $dry_run] status changed _
         if {$status ne "ok"} { set exit_code 1 }
         if {$changed} { lappend changed_paths [dict get $fentry path] }
         puts ""
@@ -4719,7 +4707,7 @@ proc enforce_cli {policy_path dry_run auto_yes remote_name} {
         foreach fid $repair_ids {
             set fentry [dict get $plan $fid]
             puts "📁 [dict get $fentry path]"
-            lassign [enforce_folder $fid $fentry $entity $root_id $access_token 0] status _ _
+            lassign [enforce_folder $fid $fentry $root_id $access_token 0] status _ _
             if {$status ne "ok"} { set exit_code 1 }
             puts ""
         }
@@ -4754,10 +4742,10 @@ proc main {argc argv} {
         {max-depth.arg "0" "Max depth (default: 3 with -r, 0 otherwise)"}
         {type.arg "folders" "Item type: folders|files|both (default: folders)"}
         {format.arg "text" "Output format: text|csv (default: text)"}
-        {dry-run "Preview changes (with --remove-user)"}
+        {dry-run "Preview changes (with --remove-user or --enforce)"}
         {read-only "Grant read-only access (with --invite, default: read/write)"}
-        {y "Skip confirmation prompts (with --remove-user)"}
-        {yes "Skip confirmation prompts (with --remove-user)"}
+        {y "Skip confirmation prompts (with --remove-user or --enforce)"}
+        {yes "Skip confirmation prompts (with --remove-user or --enforce)"}
         {debug "Enable debug output"}
         {remote.arg "OneDrive" "OneDrive remote name"}
     }

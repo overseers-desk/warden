@@ -105,18 +105,19 @@ wish acl-manager "Finance"
 
 People forget permissions: they share a folder mid-task, staff leave, folders move, and nobody notices until data has leaked. A policy file turns the intended sharing state into data the tool can check and restore. It is YAML with three sections: `groups` name people once (each member records email, name, contractual relationship, and why they have access), `collections` name folder sets by path plus stable item id (the id survives renames and moves, which is how drift is caught), and `grants` join a group to a collection with a role (`read` or `write`).
 
+Folder paths run from the drive root, so one policy file covers every top-level folder on a drive. A drive holding several companies' folders is governed by one file, and a folder outside every collection is simply not audited.
+
 A grant reaches descendants through OneDrive inheritance, so a folder's entitlements are its own grants plus its policy ancestors'. A collection marked `closed: true` is the exception: its folders admit exactly their own grants, and anything beyond, direct or inherited, is a violation. `--audit` reports violations folder by folder (`--format csv` for machines) and exits nonzero on any; `--enforce` invites missing users quietly (no notification email), downgrades or removes wrong ones, and handles inherited permissions with the move-to-root cycle described in `docs/PHANTOM-INHERITANCE-BUG.md`, re-checking descendants of changed folders for leaked copies afterwards.
 
 ## Scheduled audits
 
 Permission drift accumulates quietly, so the audit is worth running on a schedule (weekly suits a small organisation) rather than when someone remembers. The recurring task:
 
-1. Run `./acl-manager --audit <policy file>`. The repository holding your policy file may wrap this in a make target; if so, run that instead, since it pins the right policy path.
-2. Exit 0: nothing to do. The report may still carry `ℹ️` lines, which are tolerated by policy and need no action.
-3. Exit 1 with `❌` lines: the drive drifted. Read what drifted. New shares by colleagues mid-task and leaked inherited copies in locked folders are the common kinds.
-4. Fix by running `--enforce` with the same policy file: first with `--dry-run` to see the change list, then for real. Enforcement touches only what the report showed.
-5. An account in the report that the policy does not know (an `extra`) is a judgement call, and enforcement deliberately leaves open-collection extras alone: identify the account, then either add it to a group in the policy file with its name, relationship, and reason, or have its access removed. Escalate to the policy's owner when unsure.
-6. Exit 2 is a policy-file error, and transport errors mean the run could not see some folders; re-run before trusting either.
+1. Run `./acl-manager --audit <policy file>`. The repository holding your policy file may wrap this in a make target; if so, run that instead, since it pins the right policy path. A make target reaching a tool in a sibling repository expects both checkouts under one parent directory.
+2. Exit 1 with `❌` lines: the drive drifted. Read what drifted. New shares by colleagues mid-task and leaked inherited copies in locked folders are the common kinds.
+3. Fix by running `--enforce` with the same policy file: first with `--dry-run` to see the change list, then for real. Enforcement touches only what the report showed.
+4. Exit 0 means no violation, and the run is done. The `ℹ️` lines it may still carry are accounts on open collections that the policy does not name, tolerated because enforcement never removes them unasked. They are worth a look when one is new: identify the person (a contacts file or staff register usually settles it), then either send it to the policy's owner to be written into a group with name, relationship, and reason, or to have the access removed. An `ℹ️` line you have already recognised needs nothing.
+5. Exit 2 is a policy-file error, and transport errors mean the run could not see some folders; re-run before trusting either.
 
 Changes to this procedure land in this section, so re-read it when the audit starts behaving differently than described.
 
