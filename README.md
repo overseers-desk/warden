@@ -37,12 +37,12 @@ brew install tcl-tk                        # macOS
 
 GUI:
 ```bash
-wish acl-manager.tcl [item_path] [remote_name]
+wish acl-manager [item_path] [remote_name]
 ```
 
 Command line:
 ```bash
-tclsh acl-manager.tcl [OPTIONS] [PATH]
+./acl-manager [OPTIONS] [PATH]
 ```
 
 `PATH` is the folder or file to inspect (default `/`, the root) and must come after all options. Options take either one dash or two (`-r` or `--recursive`); help prints the single-dash form, both work.
@@ -65,40 +65,40 @@ tclsh acl-manager.tcl [OPTIONS] [PATH]
 
 ```bash
 # Audit a folder and everything under it
-tclsh acl-manager.tcl -r "Finance"
+./acl-manager -r "Finance"
 
 # ...deeper than the default 3 levels
-tclsh acl-manager.tcl -r --max-depth 10 "Projects"
+./acl-manager -r --max-depth 10 "Projects"
 
 # ...including files, not just folders
-tclsh acl-manager.tcl -r --type both "Confidential"
+./acl-manager -r --type both "Confidential"
 
 # Find everywhere an ex-employee still has access
-tclsh acl-manager.tcl --only-user exemployee@example.com -r "Company"
+./acl-manager --only-user exemployee@example.com -r "Company"
 
 # One folder, no recursion
-tclsh acl-manager.tcl "Finance/Budget2025"
+./acl-manager "Finance/Budget2025"
 
 # Whether one user can reach one folder
-tclsh acl-manager.tcl --only-user bob@example.com "Finance/Budget2025"
+./acl-manager --only-user bob@example.com "Finance/Budget2025"
 
 # Remove an ex-employee across a tree: preview first, then do it
-tclsh acl-manager.tcl --remove-user exemployee@example.com -r --dry-run "Projects"
-tclsh acl-manager.tcl --remove-user exemployee@example.com -r "Projects"
+./acl-manager --remove-user exemployee@example.com -r --dry-run "Projects"
+./acl-manager --remove-user exemployee@example.com -r "Projects"
 
 # Invite someone to a folder (children inherit it)
-tclsh acl-manager.tcl --invite newaccountant@example.com "Finance"
+./acl-manager --invite newaccountant@example.com "Finance"
 
 # ...read-only
-tclsh acl-manager.tcl --invite auditor@example.com --read-only "Reports"
+./acl-manager --invite auditor@example.com --read-only "Reports"
 
 # Audit the drive against a policy file, then apply the fixes
-tclsh acl-manager.tcl --audit acl-policy.yaml
-tclsh acl-manager.tcl --enforce acl-policy.yaml --dry-run
-tclsh acl-manager.tcl --enforce acl-policy.yaml
+./acl-manager --audit acl-policy.yaml
+./acl-manager --enforce acl-policy.yaml --dry-run
+./acl-manager --enforce acl-policy.yaml
 
 # GUI for interactive browsing
-wish acl-manager.tcl "Finance"
+wish acl-manager "Finance"
 ```
 
 ## Policy files
@@ -106,6 +106,19 @@ wish acl-manager.tcl "Finance"
 People forget permissions: they share a folder mid-task, staff leave, folders move, and nobody notices until data has leaked. A policy file turns the intended sharing state into data the tool can check and restore. It is YAML with three sections: `groups` name people once (each member records email, name, contractual relationship, and why they have access), `collections` name folder sets by path plus stable item id (the id survives renames and moves, which is how drift is caught), and `grants` join a group to a collection with a role (`read` or `write`).
 
 A grant reaches descendants through OneDrive inheritance, so a folder's entitlements are its own grants plus its policy ancestors'. A collection marked `closed: true` is the exception: its folders admit exactly their own grants, and anything beyond, direct or inherited, is a violation. `--audit` reports violations folder by folder (`--format csv` for machines) and exits nonzero on any; `--enforce` invites missing users quietly (no notification email), downgrades or removes wrong ones, and handles inherited permissions with the move-to-root cycle described in `docs/PHANTOM-INHERITANCE-BUG.md`, re-checking descendants of changed folders for leaked copies afterwards.
+
+## Scheduled audits
+
+Permission drift accumulates quietly, so the audit is worth running on a schedule (weekly suits a small organisation) rather than when someone remembers. The recurring task:
+
+1. Run `./acl-manager --audit <policy file>`. The repository holding your policy file may wrap this in a make target; if so, run that instead, since it pins the right policy path.
+2. Exit 0: nothing to do. The report may still carry `ℹ️` lines, which are tolerated by policy and need no action.
+3. Exit 1 with `❌` lines: the drive drifted. Read what drifted. New shares by colleagues mid-task and leaked inherited copies in locked folders are the common kinds.
+4. Fix by running `--enforce` with the same policy file: first with `--dry-run` to see the change list, then for real. Enforcement touches only what the report showed.
+5. An account in the report that the policy does not know (an `extra`) is a judgement call, and enforcement deliberately leaves open-collection extras alone: identify the account, then either add it to a group in the policy file with its name, relationship, and reason, or have its access removed. Escalate to the policy's owner when unsure.
+6. Exit 2 is a policy-file error, and transport errors mean the run could not see some folders; re-run before trusting either.
+
+Changes to this procedure land in this section, so re-read it when the audit starts behaving differently than described.
 
 ## Permissions and tokens
 
