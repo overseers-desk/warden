@@ -3971,7 +3971,8 @@ proc gui_fetch_acl {item_id remote_name} {
 # the two. A grant binds at the folders of its collection ("bound" ACL,
 # write beating read) and reaches descendants through OneDrive inheritance,
 # so a folder's "effective" ACL is the union of bound ACLs over itself and
-# every policy ancestor. Live direct permissions are judged against the
+# every policy ancestor; a closed folder's is its own bound ACL alone.
+# Live direct permissions are judged against the
 # folder's own entitlements; live inherited permissions are judged at their
 # source, so only inherited access exceeding the effective ACL is flagged
 # here. closed: true on a collection makes excess a violation; on open
@@ -4141,10 +4142,16 @@ proc policy_load {yaml_path} {
         }
     }
 
-    # Effective ACL: what a user may hold at this folder from any source —
+    # Effective ACL: what a user may hold at this folder from any source,
     # the folder's own grants plus every policy ancestor's (OneDrive
-    # inheritance carries ancestor grants down), write beating read
+    # inheritance carries ancestor grants down), write beating read.
+    # A closed folder absorbs nothing: its ACL is exhaustively its own
+    # grants, and enforcement severs inheritance to make that real.
     dict for {fid fentry} $plan {
+        if {[dict get $fentry closed]} {
+            dict set plan $fid effective [dict get $fentry expected]
+            continue
+        }
         set fpath [dict get $fentry path]
         set effective [dict get $fentry expected]
         dict for {aid aentry} $plan {
