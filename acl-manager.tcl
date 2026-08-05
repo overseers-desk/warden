@@ -2453,6 +2453,23 @@ proc show_oauth_modal_dialog {} {
 }
 
 proc make_http_request {url headers {method GET} {body ""}} {
+    # Transient transport failures (no HTTP status at all) are retried; any
+    # real HTTP status, success or error, passes straight through
+    for {set attempt 1} {$attempt <= 3} {incr attempt} {
+        set result [make_http_request_once $url $headers $method $body]
+        set status [lindex $result 0]
+        if {$status ne "error" && $status ne ""} {
+            return $result
+        }
+        if {$attempt < 3} {
+            debug_log "Transient transport failure, retrying ($attempt/3): $url"
+            after 2000
+        }
+    }
+    return $result
+}
+
+proc make_http_request_once {url headers {method GET} {body ""}} {
     # Enhanced HTTP request supporting GET, POST, DELETE with better 401 handling
     set response ""
     
@@ -4451,6 +4468,26 @@ proc enforce_remove_emails {fid emails access_token} {
             lappend blocked $email
         }
     }
+
+    # Deleting an inherited copy of a leaked permission reports success yet
+    # the entry survives (docs/PHANTOM-INHERITANCE-BUG.md, retest
+    # 2026-08-05), so success is only believed after a re-read
+    if {[llength $removed] > 0} {
+        after 1000
+        lassign [get_folder_permissions $fid $access_token] vstatus vperms
+        if {$vstatus eq "ok"} {
+            set still [extract_users_from_permissions $vperms]
+            set truly_removed {}
+            foreach email $removed {
+                if {[dict exists $still $email]} {
+                    lappend blocked $email
+                } else {
+                    lappend truly_removed $email
+                }
+            }
+            set removed $truly_removed
+        }
+    }
     return [list $removed $blocked]
 }
 
@@ -4611,12 +4648,15 @@ proc enforce_cli {policy_path dry_run auto_yes remote_name} {
     puts ""
     set violations {}
     set dirty_ids {}
+    set audit_errors 0
     foreach fid [plan_ids_parents_first $plan] {
         lassign [audit_folder $fid [dict get $plan $fid] $entity $access_token] v _ _
         lappend violations {*}$v
         foreach viol $v {
             if {[dict get $viol type] in {missing_user wrong_role extra_user leaked_inherited}} {
                 if {[lsearch -exact $dirty_ids $fid] < 0} { lappend dirty_ids $fid }
+            } elseif {[dict get $viol type] in {error not_found}} {
+                incr audit_errors
             }
         }
     }
@@ -4685,6 +4725,10 @@ proc enforce_cli {policy_path dry_run auto_yes remote_name} {
         }
     }
 
+    if {$audit_errors > 0} {
+        puts "⚠️  $audit_errors folder(s) could not be audited and were not enforced; re-run."
+        set exit_code 1
+    }
     if {$exit_code == 0} {
         puts "✅ Enforcement complete; drive matches the policy."
     } else {
