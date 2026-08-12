@@ -138,6 +138,24 @@ proc copy_to_clipboard {text} {
     clipboard append $text
 }
 
+# A bare invocation asks for the browser; every other one names work for the
+# command line. Tk is loaded into this interpreter rather than reached by
+# re-execing a wish, which keeps one process and makes the toolkit version
+# follow the shell: a Tcl 9 interpreter can load nothing but Tk 9. Failure to
+# load leaves tk undefined, so the blocks below stand down and the command
+# line answers instead.
+if {$argc == 0 || $argv eq {-debug}} {
+    if {[catch {package require Tk} tk_error]} {
+        puts stderr "The browser cannot open: $tk_error"
+        if {[string match "can't find package*" $tk_error]} {
+            puts stderr "(Debian/Ubuntu: sudo apt-get install tk9.0)"
+        }
+        puts stderr ""
+    } else {
+        package require Ttk
+    }
+}
+
 if {[info commands tk] ne ""} {
     # Declare global widget variables
     global remote_entry url_entry fetch_button acl_path_label selected_item action_buttons_frame f
@@ -5067,28 +5085,7 @@ proc main {argc argv} {
     }
 }
 
-proc find_wish {} {
-    # The interpreter that can draw the browser. Tk's major version has to
-    # match the shell driving it, so a Tcl 8.6 shell cannot use a Tk 9
-    # toolkit; and the binary is unversioned on some systems, versioned on
-    # others, so ask for both. Returns "" when the system has no Tk at all.
-    foreach candidate {wish wish9.1 wish9.0 wish8.7 wish8.6} {
-        set path [auto_execok $candidate]
-        if {$path ne ""} {
-            return $path
-        }
-    }
-    return ""
-}
-
-proc has_display {} {
-    return [expr {[info exists ::env(DISPLAY)] || [info exists ::env(WAYLAND_DISPLAY)]}]
-}
-
 if {[info commands tk] ne ""} {
-    package require Tk
-    package require Ttk
-
     # GUI MODE - Parse command line arguments
     
     # Check for -debug flag in GUI mode
@@ -5120,20 +5117,12 @@ if {[info commands tk] ne ""} {
     set root_item [lindex [$browser_tree children {}] 0]
     load_tree_children $browser_tree $root_item "root"
     $browser_tree item $root_item -open 1
+
+    # wish would enter the event loop on reaching the end of the script; a
+    # tclsh has to be told. Waiting on the main window rather than a variable
+    # that is never set means closing the browser ends the process.
+    tkwait window .
 } else {
-    # A shell without Tk. Called with no arguments, on a desktop, the
-    # caller wants to browse: hand the script to a wish that can draw it.
-    # Every other invocation names something to do, which is the command
-    # line's job.
-    if {$argc == 0 && [has_display]} {
-        set wish [find_wish]
-        if {$wish ne ""} {
-            exec {*}$wish [info script] >@ stdout 2>@ stderr
-            exit 0
-        }
-        puts stderr "No Tk found, so the browser cannot open (Debian/Ubuntu: sudo apt-get install tk). Showing the permissions of the drive root instead."
-        puts stderr ""
-    }
     main $argc $argv
 }
 
