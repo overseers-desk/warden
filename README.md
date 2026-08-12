@@ -29,7 +29,7 @@ Two interfaces: a Tcl/Tk GUI for browsing folders and viewing permissions (a sub
 
 ```bash
 rclone config                              # set up your OneDrive remote
-sudo apt-get install tcllib tcl-tls        # Ubuntu/Debian
+sudo apt-get install tcllib tcl-tls tk     # Ubuntu/Debian; tk is for the browser
 brew install tcl-tk                        # macOS
 ```
 
@@ -37,8 +37,11 @@ brew install tcl-tk                        # macOS
 
 GUI:
 ```bash
-wish acl-manager [item_path] [remote_name]
+./acl-manager                              # opens the browser at the drive root
+wish acl-manager [item_path] [remote_name] # ...starting at a folder
 ```
+
+Run with no arguments on a desktop and it opens the browser, finding a Tk interpreter itself: that binary is called `wish` on some systems and `wish9.0` or similar on others, and a Tcl 8.6 shell cannot drive a Tk 9 toolkit. With no display, or with any argument, it stays on the command line, so starting the browser at a particular folder means naming your `wish` yourself.
 
 Command line:
 ```bash

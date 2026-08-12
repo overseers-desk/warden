@@ -5043,6 +5043,24 @@ proc main {argc argv} {
     }
 }
 
+proc find_wish {} {
+    # The interpreter that can draw the browser. Tk's major version has to
+    # match the shell driving it, so a Tcl 8.6 shell cannot use a Tk 9
+    # toolkit; and the binary is unversioned on some systems, versioned on
+    # others, so ask for both. Returns "" when the system has no Tk at all.
+    foreach candidate {wish wish9.1 wish9.0 wish8.7 wish8.6} {
+        set path [auto_execok $candidate]
+        if {$path ne ""} {
+            return $path
+        }
+    }
+    return ""
+}
+
+proc has_display {} {
+    return [expr {[info exists ::env(DISPLAY)] || [info exists ::env(WAYLAND_DISPLAY)]}]
+}
+
 if {[info commands tk] ne ""} {
     package require Tk
     package require Ttk
@@ -5079,6 +5097,19 @@ if {[info commands tk] ne ""} {
     load_tree_children $browser_tree $root_item "root"
     $browser_tree item $root_item -open 1
 } else {
+    # A shell without Tk. Called with no arguments, on a desktop, the
+    # caller wants to browse: hand the script to a wish that can draw it.
+    # Every other invocation names something to do, which is the command
+    # line's job.
+    if {$argc == 0 && [has_display]} {
+        set wish [find_wish]
+        if {$wish ne ""} {
+            exec {*}$wish [info script] >@ stdout 2>@ stderr
+            exit 0
+        }
+        puts stderr "No Tk found, so the browser cannot open (Debian/Ubuntu: sudo apt-get install tk). Showing the permissions of the drive root instead."
+        puts stderr ""
+    }
     main $argc $argv
 }
 

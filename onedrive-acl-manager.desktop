@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=OneDrive ACL Manager
+Comment=Scan and manage OneDrive folder permissions and access control lists
+Exec=/home/weiwu/code/OneDrive-ACL-Manager/acl-manager
+Path=/home/weiwu/code/OneDrive-ACL-Manager
+Icon=application-x-executable
+Terminal=false
+Categories=Utility;FileManager;
+StartupNotify=true
+MimeType=
+Keywords=onedrive;acl;permissions;access;control;manager;
+
