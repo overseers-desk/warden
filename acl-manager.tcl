@@ -21,7 +21,6 @@
 #    CLI:      run with an item path, or with any option; -help lists them
 #
 #    item_path: Path to the folder or file in OneDrive
-#    remote_name: Name of the OneDrive remote (default: OneDrive)
 
 package require Tcl 9
 package require http
@@ -83,57 +82,9 @@ set selected_item {}      ;# Currently selected item {id is_folder}
 set fetch_button ""       ;# Fetch ACL button widget
 set acl_path_label ""     ;# Label showing path of current ACL display
 
-# Copy text to clipboard with workaround for Tk 8.x emoji bug
-# Tk 8.x corrupts Unicode characters outside BMP (including emoji) when
-# copying to X11 clipboard. This proc uses external tools as a fallback.
+# Tk 9 carries characters outside the BMP to the X11 clipboard intact, so a
+# path holding an emoji copies as itself.
 proc copy_to_clipboard {text} {
-    # Check Tk version - Tk 9+ handles Unicode correctly
-    set tk_major [lindex [split [package require Tk] .] 0]
-    if {$tk_major >= 9} {
-        clipboard clear
-        clipboard append $text
-        return
-    }
-
-    # Tk 8.x workaround: only needed on Linux (X11/Wayland)
-    # On macOS/Windows, native clipboard handles Unicode correctly
-    global tcl_platform
-    if {$tcl_platform(os) ne "Linux"} {
-        clipboard clear
-        clipboard append $text
-        return
-    }
-
-    # Detect Wayland vs X11
-    set is_wayland [expr {[info exists ::env(WAYLAND_DISPLAY)] && $::env(WAYLAND_DISPLAY) ne ""}]
-
-    if {$is_wayland} {
-        # Try wl-copy for Wayland (run in background to not block)
-        if {![catch {exec which wl-copy}]} {
-            set tmpfile "/tmp/tcl_clipboard_[pid].txt"
-            set fd [open $tmpfile w]
-            fconfigure $fd -encoding utf-8
-            puts -nonewline $fd $text
-            close $fd
-            catch {exec sh -c "wl-copy < $tmpfile && rm -f $tmpfile" &}
-            return
-        }
-    }
-
-    # Try xclip for X11 or XWayland
-    if {![catch {exec which xclip}]} {
-        # Write to temp file to avoid shell escaping issues
-        set tmpfile "/tmp/tcl_clipboard_[pid].txt"
-        set fd [open $tmpfile w]
-        fconfigure $fd -encoding utf-8
-        puts -nonewline $fd $text
-        close $fd
-        # Run xclip in background (&) - it forks and waits for paste requests
-        catch {exec sh -c "xclip -selection clipboard -i $tmpfile && rm -f $tmpfile" &}
-        return
-    }
-
-    # Fallback to native clipboard (will have emoji issues on Tk 8.x)
     clipboard clear
     clipboard append $text
 }
@@ -151,12 +102,15 @@ if {$argc == 0 || $argv eq {-debug}} {
             puts stderr "(Debian/Ubuntu: sudo apt-get install tk9.0)"
         }
         puts stderr ""
-    } else {
-        package require Ttk
     }
 }
 
 if {[info commands tk] ne ""} {
+    # Stated rather than assumed. Tk 9 provides Ttk as it loads, and the
+    # browser is also reachable by starting the script under wish, which
+    # never passes through the block above.
+    package require Ttk
+
     # Declare global widget variables
     global remote_entry url_entry fetch_button acl_path_label selected_item action_buttons_frame f
     

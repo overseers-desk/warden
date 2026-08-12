@@ -29,8 +29,8 @@ Two interfaces: a Tcl/Tk GUI for browsing folders and viewing permissions (a sub
 
 ```bash
 rclone config                              # set up your OneDrive remote
-sudo apt-get install tcllib tcl-tls tk     # Ubuntu/Debian; tk is for the browser
-brew install tcl-tk                        # macOS
+sudo apt-get install tcl9.0 tk9.0 tcllib tcl-tls   # Ubuntu/Debian; tk9.0 is for the browser
+brew install tcl-tk                                # macOS
 ```
 
 ## Usage
@@ -38,10 +38,10 @@ brew install tcl-tk                        # macOS
 GUI:
 ```bash
 ./acl-manager                              # opens the browser at the drive root
-wish acl-manager [item_path] [remote_name] # ...starting at a folder
+wish9.0 acl-manager.tcl "Finance"          # ...starting at a folder
 ```
 
-Run with no arguments on a desktop and it opens the browser, finding a Tk interpreter itself: that binary is called `wish` on some systems and `wish9.0` or similar on others, and a Tcl 8.6 shell cannot drive a Tk 9 toolkit. With no display, or with any argument, it stays on the command line, so starting the browser at a particular folder means naming your `wish` yourself.
+Run with no arguments and it opens the browser at the drive root, loading Tk into the interpreter it is already running in. Any argument sends it to the command line instead, so starting the browser at a particular folder means running it under `wish9.0` and naming the folder. Tcl and Tk 9 are required: names on the drive carry characters an older Tcl cannot hold in a string, so the script stops on one rather than show you a name that is not the name.
 
 Command line:
 ```bash
@@ -101,7 +101,7 @@ Command line:
 ./acl-manager --enforce acl-policy.yaml
 
 # GUI for interactive browsing
-wish acl-manager "Finance"
+wish9.0 acl-manager.tcl "Finance"
 ```
 
 ## Policy files
@@ -144,7 +144,9 @@ Safety: destructive operations prompt for confirmation (not bypassable) and owne
 
 **Token expired and auto-refresh failed.** For `token.json`, run the GUI and do any write operation to trigger a fresh web sign-in. For `rclone.conf`, run any rclone command, e.g. `rclone about OneDrive:`.
 
-**Missing packages.** `sudo apt-get install tcllib tcl-tls`.
+**Missing packages.** `sudo apt-get install tcl9.0 tcllib tcl-tls`.
+
+**`version conflict for package "Tcl": have 8.6.x, need 9`.** The shell that started the script is Tcl 8. On Debian and Ubuntu the unversioned `tclsh` and `wish` are the 8.6 ones, so name `tclsh9.0` or `wish9.0` explicitly.
 
 **Access denied.** Check the path, that you're allowed to view the ACL, and that your rclone token has enough scope.
 
