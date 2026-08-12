@@ -1,4 +1,4 @@
-#!/usr/bin/env tclsh
+#!/usr/bin/env tclsh9.0
 #
 # OneDrive ACL Lister - Tcl/Tk GUI Version with Command Line Support
 # Using rclone.conf token to access Microsoft Graph API directly
@@ -10,21 +10,20 @@
 #
 #
 # Prerequisites:
+# - Tcl/Tk 9. Item names carry characters outside the BMP, which Tcl 8 cannot
+#   hold in a string, so an 8.x shell is refused rather than run degraded.
 # - rclone must be installed and configured with OneDrive remote
 # - tls package for HTTPS requests (package require tls)
 # - Valid OAuth token in ~/.config/rclone/rclone.conf
 #
 # Usage:
-#    GUI mode:    wish acl_demo.tcl [item_path] [remote_name]
-#    CLI mode:    tclsh acl_demo.tcl <item_path> [remote_name]
-#    
-#    item_path: Required. Path to the folder or file in OneDrive
-#    remote_name: Optional. Name of the OneDrive remote (default: OneDrive)
+#    Browser:  run with no arguments
+#    CLI:      run with an item path, or with any option; -help lists them
 #
-# Example:
-#    wish acl_demo.tcl "Documents"
-#    tclsh acl_demo.tcl "Documents/Project" "MyOneDrive"
+#    item_path: Path to the folder or file in OneDrive
+#    remote_name: Name of the OneDrive remote (default: OneDrive)
 
+package require Tcl 9
 package require http
 package require json
 package require json::write
