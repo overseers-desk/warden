@@ -668,6 +668,28 @@ proc url_encode {path} {
     return $encoded
 }
 
+proc combine_surrogate_escapes {jsontext} {
+    # Graph escapes anything outside the BMP as a UTF-16 surrogate pair,
+    # "\uD83C\uDDEC" for the first half of a flag. The json package unescapes
+    # by handing the string body to [subst], which turns each half into a
+    # separate lone surrogate, so a name that starts with a flag arrives as
+    # four unrenderable characters. Combine the pairs before parsing.
+    #
+    # Only pairs are touched. A combined pair is always outside the BMP, so
+    # this can never produce a quote, backslash or control character that
+    # would change the structure of the document.
+    return [regsub -all -command \
+        {(\\*)\\u([Dd][89ABab][0-9A-Fa-f]{2})\\u([Dd][C-Fc-f][0-9A-Fa-f]{2})} \
+        $jsontext {apply {{whole bs hi lo} {
+            # An odd run of backslashes means the "\u" is literal text, as in
+            # a name containing C:\uD83C, and must be left alone.
+            if {[string length $bs] % 2} { return $whole }
+            scan $hi %x h
+            scan $lo %x l
+            return $bs[format %c [expr {(($h - 0xD800) << 10) + ($l - 0xDC00) + 0x10000}]]
+        }}}]
+}
+
 proc url_decode {str} {
     # Decode %XX URL-encoded sequences back to characters
     # Companion to url_encode above
@@ -2491,7 +2513,7 @@ proc make_http_request_once {url headers {method GET} {body ""}} {
         if {$status eq "204"} {
             set data ""
         } else {
-            set data [http::data $response]
+            set data [combine_surrogate_escapes [http::data $response]]
         }
         http::cleanup $response
         
