@@ -2506,19 +2506,18 @@ proc make_http_request_once {url headers {method GET} {body ""}} {
                         if {[dict exists $error_info code]} {
                             set error_code [dict get $error_info code]
                             if {$error_code eq "InvalidAuthenticationToken" || [string match "*expired*" [string tolower $error_code]]} {
-                                puts "ERROR: HTTP 401 - Token expired or invalid"
-                                puts "ERROR: $data"
+                                debug_log "HTTP 401 - Token expired or invalid: $data"
                                 set result [list $status "TOKEN_EXPIRED: $data"]
                                 return $result
                             }
                         }
                     }
                 }
-                puts "ERROR: HTTP 401 - Authentication failed - URL: $url"
+                debug_log "HTTP 401 - Authentication failed - URL: $url"
             } else {
-                puts "ERROR: HTTP $status - URL: $url"
+                debug_log "HTTP $status - URL: $url"
             }
-            puts "ERROR: Response data: $data"
+            debug_log "Response data: $data"
         }
         
         set result [list $status $data]
@@ -2548,8 +2547,7 @@ proc make_http_request_once {url headers {method GET} {body ""}} {
             return [list "204" ""]
         }
         
-        puts "ERROR: HTTP request failed - $error"
-        puts "ERROR: URL was: $url"
+        debug_log "HTTP request failed - $error (URL: $url)"
         set result [list "error" $error]
     }
     return $result
@@ -2594,12 +2592,17 @@ proc invite_user_to_item {item_id email role access_token {quiet 0}} {
             return [list "ok-notified" "Invited $email with $role permission (service refused quiet invite; notification email sent)"]
         }
         return $result
+    } elseif {$status eq "400"} {
+        # OneDrive answers "sharingFailed" whenever it will not create the
+        # share, and the usual reason is that the address is not a Microsoft
+        # account, so there is no identity to grant anything to
+        return [list "error" "$email cannot be invited: OneDrive refused the share, usually because the address is not a Microsoft account"]
     } elseif {$status eq "403"} {
         return [list "error" "Insufficient permissions to invite users"]
     } elseif {$status eq "404"} {
         return [list "error" "Item not found"]
     } else {
-        return [list "error" "Failed to invite user: HTTP $status"]
+        return [list "error" "Could not invite $email (HTTP $status); re-run with --debug for the service's reply"]
     }
 }
 
