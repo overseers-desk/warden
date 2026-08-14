@@ -105,6 +105,18 @@ For shared folders where the caller's access is inherited from a parent, `/2/sha
 
 When `/2/files/list_folder` is called with `recursive=true`, the queried path itself is one of the entries returned (as the first entry). Filter by `path_lower` equality with the root before treating entries as descendants.
 
+## list_folder_members marks inheritance on the record
+
+Each member record in `/2/sharing/list_folder_members` carries `is_inherited`; an inherited record additionally carries `inherited_access_type`. A nested share therefore reports both its own members (`is_inherited: false`) and members reaching it from ancestor shares (`is_inherited: true`) in one call, so classifying direct vs inherited membership needs no ancestor walk. The walk is still needed to name which ancestor a membership comes from, and for links.
+
+## The file id ("id:...") round-trips for every folder
+
+`/2/files/get_metadata` accepts the `id:` form in its `path` argument and resolves it for shared roots, nested shares, and plain unshared folders alike. For folders, `sharing_info` in the same response carries `shared_folder_id` and, when nested, `parent_shared_folder_id`, so the sharing-graph ancestor chain is reachable from file metadata. The `id:` form is the stable folder reference; a shared-folder id (sfid) appears and disappears with share state.
+
+## Viewer members exist on Basic shares
+
+A Basic account's share can hold a member with `access_type: viewer` (observed live). The `insufficient_plan` gate documented for `add_folder_member`/`update_folder_member` restricts creating or downgrading to viewer through the API on an unpaid plan; it does not mean viewer records cannot exist (the web UI, another member's plan, or an earlier plan may have created them). Read code must handle viewer; write code discovers its own limits from the API error, not from an assumption that viewers are impossible.
+
 # Story: 2026-05-09, /2023-05 Signed unshare blocked by no-path child sfid 4087858721
 
 ## Setting out
