@@ -1,0 +1,523 @@
+# OneDrive via the Microsoft Graph API: item metadata, permission listing and normalization, invite/remove/move.
+package require json
+package require json::write
+
+proc convert_onedrive_url_to_path {url} {
+    # Convert a OneDrive web URL to a relative path
+    # Supports onedrive.live.com and *.sharepoint.com URLs
+    # Returns the original string unchanged if not a OneDrive URL
+    if {![string match "https://onedrive.live.com*" $url] && ![string match "https://*.sharepoint.com*" $url]} {
+        return $url
+    }
+
+    # Extract the 'id' query parameter
+    if {![regexp {[?&]id=([^&]*)} $url -> id_value]} {
+        return $url
+    }
+
+    set decoded [url_decode $id_value]
+
+    # Strip /personal/{drive_id}/Documents/ prefix
+    if {[regexp {^/personal/[^/]+/Documents/(.+)$} $decoded -> rel_path]} {
+        return $rel_path
+    } elseif {[regexp {^/personal/[^/]+/Documents/?$} $decoded]} {
+        return "/"
+    }
+
+    # Fallback: return decoded id as-is
+    return $decoded
+}
+
+proc extract_item_metadata {item_dict} {
+    # Safely extract metadata fields from a Graph API item dict
+    # Returns a dict with keys: name, type, created_by, created_date, modified_by, modified_date, size, caption
+    set meta {}
+
+    dict set meta name [expr {[dict exists $item_dict name] ? [dict get $item_dict name] : "N/A"}]
+
+    if {[dict exists $item_dict folder]} {
+        dict set meta type "folder"
+    } elseif {[dict exists $item_dict file]} {
+        dict set meta type "file"
+    } else {
+        dict set meta type "item"
+    }
+
+    if {[dict exists $item_dict createdBy user displayName]} {
+        dict set meta created_by [dict get $item_dict createdBy user displayName]
+    } else {
+        dict set meta created_by "N/A"
+    }
+
+    dict set meta created_date [expr {[dict exists $item_dict createdDateTime] ? [dict get $item_dict createdDateTime] : "N/A"}]
+
+    if {[dict exists $item_dict lastModifiedBy user displayName]} {
+        dict set meta modified_by [dict get $item_dict lastModifiedBy user displayName]
+    } else {
+        dict set meta modified_by "N/A"
+    }
+
+    dict set meta modified_date [expr {[dict exists $item_dict lastModifiedDateTime] ? [dict get $item_dict lastModifiedDateTime] : "N/A"}]
+
+    if {[dict exists $item_dict size]} {
+        dict set meta size [format_file_size [dict get $item_dict size]]
+    } else {
+        dict set meta size "N/A"
+    }
+
+    # Caption is the server-side description (the web "Add a caption" field)
+    dict set meta caption [expr {[dict exists $item_dict description] ? [dict get $item_dict description] : ""}]
+
+    return $meta
+}
+
+proc extract_users_from_perm {perm} {
+    # Extract ALL users from grantedTo or grantedToIdentities
+    # Returns list of {displayName email} pairs (can be multiple for grantedToIdentities)
+    set users {}
+    
+    if {[dict exists $perm grantedTo user]} {
+        set user [dict get $perm grantedTo user]
+        lappend users [list [dict get $user displayName] [dict get $user email]]
+    }
+    
+    if {[dict exists $perm grantedToIdentities]} {
+        set identities [dict get $perm grantedToIdentities]
+        foreach identity $identities {
+            if {[dict exists $identity user]} {
+                set user [dict get $identity user]
+                lappend users [list [dict get $user displayName] [dict get $user email]]
+            }
+        }
+    }
+    
+    return $users
+}
+
+proc extract_user_info {perm} {
+    # Extract user display name and email from a permission object
+    # Returns {displayName email} or {"N/A" "N/A"}
+    set users [extract_users_from_perm $perm]
+    if {[llength $users] > 0} {
+        return [lindex $users 0]
+    }
+    return [list "N/A" "N/A"]
+}
+
+proc is_owner_permission {perm} {
+    # Check if permission has owner role
+    set roles [dict get $perm roles]
+    return [expr {[lsearch $roles "owner"] >= 0}]
+}
+
+proc is_inherited_permission {perm} {
+    # Check if permission is inherited
+    return [dict exists $perm inheritedFrom]
+}
+
+proc build_graph_api_url {endpoint} {
+    # Build Microsoft Graph API URL
+    return "https://graph.microsoft.com/v1.0$endpoint"
+}
+
+proc extract_users_from_permissions {permissions} {
+    # Extract all non-owner users from permissions
+    # Returns: dict of {email role} pairs
+    set users_dict {}
+    
+    foreach perm $permissions {
+        if {[is_owner_permission $perm]} {
+            continue
+        }
+        
+        set roles [dict get $perm roles]
+        set role "read"
+        if {[lsearch -exact $roles "write"] >= 0} {
+            set role "write"
+        } elseif {[llength $roles] > 0} {
+            set role [lindex $roles 0]
+        }
+        
+        set user_list [extract_users_from_perm $perm]
+        foreach user_info $user_list {
+            set email [string tolower [lindex $user_info 1]]
+            if {$email ne ""} {
+                dict set users_dict $email $role
+            }
+        }
+    }
+    
+    return $users_dict
+}
+
+proc invite_user_to_item {item_id email role access_token {quiet 0}} {
+    # Invite a user to an item with specified role
+    # role: "read" or "write"
+    # quiet: suppress the notification email (sendInvitation:false); if the
+    #        service rejects that (400), retry with notification and report
+    #        status "ok-notified" so callers can surface the difference
+    # Returns: {status message}
+
+    set url "https://graph.microsoft.com/v1.0/me/drive/items/$item_id/invite"
+    set headers [list Authorization "Bearer $access_token" Content-Type "application/json"]
+
+    set body_common [list \
+        requireSignIn true \
+        roles [json::write array [json::write string $role]] \
+        recipients [json::write array [json::write object email [json::write string $email]]]]
+    if {$quiet} {
+        set body_json [json::write object {*}$body_common sendInvitation false]
+    } else {
+        set body_json [json::write object {*}$body_common \
+            message [json::write string "You have been granted $role access to this item."]]
+    }
+
+    set result [make_http_request $url $headers POST $body_json]
+    set status [lindex $result 0]
+    set data [lindex $result 1]
+
+    if {$status eq "200" || $status eq "201"} {
+        return [list "ok" "Successfully invited $email with $role permission"]
+    } elseif {$quiet && $status eq "400"} {
+        # Service refused the quiet form; fall back to a notifying invite
+        set result [invite_user_to_item $item_id $email $role $access_token 0]
+        if {[lindex $result 0] eq "ok"} {
+            return [list "ok-notified" "Invited $email with $role permission (service refused quiet invite; notification email sent)"]
+        }
+        return $result
+    } elseif {$status eq "400"} {
+        # OneDrive answers "sharingFailed" whenever it will not create the
+        # share, and the usual reason is that the address is not a Microsoft
+        # account, so there is no identity to grant anything to
+        return [list "error" "$email cannot be invited: OneDrive refused the share, usually because the address is not a Microsoft account"]
+    } elseif {$status eq "403"} {
+        return [list "error" "Insufficient permissions to invite users"]
+    } elseif {$status eq "404"} {
+        return [list "error" "Item not found"]
+    } else {
+        return [list "error" "Could not invite $email (HTTP $status); re-run with --debug for the service's reply"]
+    }
+}
+
+proc get_item_by_id {item_id access_token} {
+    # Fetch an item by its stable id; the id survives renames and moves,
+    # which is what makes policy drift detectable.
+    # Returns: {ok item_dict} | {not_found {}} | {error {}}
+    set url [build_graph_api_url "/me/drive/items/$item_id?select=id,name,parentReference"]
+    set headers [list Authorization "Bearer $access_token"]
+    set result [make_http_request $url $headers]
+    set status [lindex $result 0]
+    if {$status eq "200"} {
+        return [list "ok" [json::json2dict [lindex $result 1]]]
+    } elseif {$status eq "404" || $status eq "400"} {
+        return [list "not_found" {}]
+    }
+    return [list "error" {}]
+}
+
+proc item_actual_path {item_dict} {
+    # Slash path of an item relative to the drive root, from one GET's
+    # parentReference.path (format "/drive/root:/Parent/Sub"); empty string
+    # when the reference is absent (rare; caller may fall back to
+    # get_item_path's parent-chain walk).
+    if {![dict exists $item_dict parentReference path]} {
+        return ""
+    }
+    set parent_path [dict get $item_dict parentReference path]
+    set idx [string first "root:" $parent_path]
+    if {$idx < 0} { return "" }
+    set rel [string range $parent_path [expr {$idx + 5}] end]
+    set rel [string trimleft $rel "/"]
+    # parentReference.path is URL-decoded by Graph already
+    set name [dict get $item_dict name]
+    if {$rel eq ""} { return $name }
+    return "$rel/$name"
+}
+
+proc move_item {item_id new_parent_id access_token} {
+    # Move an item under a new parent folder (PATCH parentReference).
+    # Moving a folder to the drive root converts its inherited permissions
+    # to unique ones, the only known way to delete inherited permissions on
+    # consumer OneDrive (docs/PHANTOM-INHERITANCE-BUG.md).
+    # Returns: {status message}
+    set url [build_graph_api_url "/me/drive/items/$item_id"]
+    set headers [list Authorization "Bearer $access_token" Content-Type "application/json"]
+    set body_json [json::write object parentReference \
+        [json::write object id [json::write string $new_parent_id]]]
+    set result [make_http_request $url $headers PATCH $body_json]
+    set status [lindex $result 0]
+    if {$status eq "200"} {
+        return [list "ok" "Moved"]
+    } elseif {$status eq "409"} {
+        return [list "error" "Name conflict at destination"]
+    } elseif {$status eq "403"} {
+        return [list "error" "Insufficient permissions to move item"]
+    } elseif {$status eq "404"} {
+        return [list "error" "Item not found"]
+    }
+    return [list "error" "Failed to move item: HTTP $status"]
+}
+
+proc set_item_description {item_id description access_token} {
+    # Set (or clear) an item's server-side description, the field behind the
+    # OneDrive web "Add a caption". Editable via PATCH with no file re-upload,
+    # and indexed by OneDrive search.
+    # Returns: {status message}
+
+    set url [build_graph_api_url "/me/drive/items/$item_id"]
+    set headers [list Authorization "Bearer $access_token" Content-Type "application/json"]
+
+    # json::write escapes quotes, accents and newlines in arbitrary caption text
+    set body_json [json::write object description [json::write string $description]]
+
+    set result [make_http_request $url $headers PATCH $body_json]
+    set status [lindex $result 0]
+
+    if {$status eq "200"} {
+        if {$description eq ""} {
+            return [list "ok" "Caption cleared"]
+        }
+        return [list "ok" "Caption set to: $description"]
+    } elseif {$status eq "403"} {
+        return [list "error" "Insufficient permissions to set the caption"]
+    } elseif {$status eq "404"} {
+        return [list "error" "Item not found"]
+    } elseif {$status eq "401"} {
+        return [list "error" "Token expired or invalid"]
+    } else {
+        return [list "error" "Failed to set caption: HTTP $status"]
+    }
+}
+
+proc remove_permission {item_id permission_id access_token} {
+    # Remove a specific permission from an item
+    # Returns: {status message}
+    
+    set url "https://graph.microsoft.com/v1.0/me/drive/items/$item_id/permissions/$permission_id"
+    set headers [list Authorization "Bearer $access_token"]
+    
+    set result [make_http_request $url $headers DELETE]
+    set status [lindex $result 0]
+    
+    if {$status eq "204"} {
+        return [list "ok" "Permission removed successfully"]
+    } elseif {$status eq "403"} {
+        return [list "error" "Insufficient permissions to remove this permission"]
+    } elseif {$status eq "404"} {
+        return [list "error" "Permission not found (may already be removed)"]
+    } elseif {$status eq "401"} {
+        return [list "error" "Token expired or invalid"]
+    } else {
+        return [list "error" "Failed to remove permission: HTTP $status"]
+    }
+}
+
+proc strip_explicit_permissions {item_id access_token} {
+    # Remove all explicit (non-inherited, non-owner) permissions
+    # Returns: {status count_removed message}
+    
+    # Get all permissions
+    set permissions_url "https://graph.microsoft.com/v1.0/me/drive/items/$item_id/permissions"
+    set headers [list Authorization "Bearer $access_token"]
+    set result [make_http_request $permissions_url $headers]
+    set status [lindex $result 0]
+    set data [lindex $result 1]
+    
+    if {$status ne "200"} {
+        return [list "error" 0 "Failed to fetch permissions: HTTP $status"]
+    }
+    
+    set permissions_data [json::json2dict $data]
+    set permissions [dict get $permissions_data value]
+    
+    set removed_count 0
+    set failed_count 0
+    
+    foreach perm $permissions {
+        # Skip owner permissions
+        if {[is_owner_permission $perm]} {
+            continue
+        }
+        
+        # Skip inherited permissions
+        if {[is_inherited_permission $perm]} {
+            continue
+        }
+        
+        # Remove this explicit permission
+        set permission_id [dict get $perm id]
+        set remove_result [remove_permission $item_id $permission_id $access_token]
+        set remove_status [lindex $remove_result 0]
+        
+        if {$remove_status eq "ok"} {
+            incr removed_count
+        } else {
+            incr failed_count
+        }
+    }
+    
+    if {$failed_count > 0} {
+        return [list "warning" $removed_count "Removed $removed_count permission(s), $failed_count failed"]
+    } else {
+        return [list "ok" $removed_count "Removed $removed_count explicit permission(s)"]
+    }
+}
+
+proc get_item_path {item_id access_token} {
+    # Get the full path of an item using its parent chain
+    set headers [list Authorization "Bearer $access_token"]
+    set path_parts {}
+    set current_id $item_id
+    set result_path "Unknown"
+    
+    if {[catch {
+        while {$current_id ne ""} {
+            set url "https://graph.microsoft.com/v1.0/me/drive/items/$current_id"
+            set result [make_http_request $url $headers]
+            set status [lindex $result 0]
+            set data [lindex $result 1]
+            
+            if {$status ne "200"} {
+                break
+            }
+            
+            set item_data [json::json2dict $data]
+            set name [dict get $item_data name]
+            set path_parts [linsert $path_parts 0 $name]
+            
+            if {[dict exists $item_data parentReference]} {
+                set parent_ref [dict get $item_data parentReference]
+                if {[dict exists $parent_ref path] && [dict get $parent_ref path] eq "/drive/root:"} {
+                    break
+                }
+                if {[dict exists $parent_ref id]} {
+                    set current_id [dict get $parent_ref id]
+                } else {
+                    break
+                }
+            } else {
+                break
+            }
+        }
+        
+        # Remove 'root' from path if present
+        if {[llength $path_parts] > 0 && [string tolower [lindex $path_parts 0]] eq "root"} {
+            set path_parts [lrange $path_parts 1 end]
+        }
+        
+        if {[llength $path_parts] > 0} {
+            set result_path [join $path_parts "/"]
+        }
+    } error] != 0} {
+        # Keep result_path as "Unknown"
+    }
+    
+    return $result_path
+}
+
+proc get_folder_permissions {folder_id access_token} {
+    # Get permissions for a folder, following @odata.nextLink pagination
+    # (a permission on page 2 would otherwise read as absent)
+    # Returns list of {status permissions} where status is "ok" or "error"
+    set permissions_url [build_graph_api_url "/me/drive/items/$folder_id/permissions"]
+    set headers [list Authorization "Bearer $access_token"]
+    set permissions {}
+
+    while {$permissions_url ne ""} {
+        set result [make_http_request $permissions_url $headers]
+        set status [lindex $result 0]
+        set data [lindex $result 1]
+
+        if {$status ne "200"} {
+            return [list "error" {}]
+        }
+
+        set permissions_data [json::json2dict $data]
+        lappend permissions {*}[dict get $permissions_data value]
+        if {[dict exists $permissions_data @odata.nextLink]} {
+            set permissions_url [dict get $permissions_data @odata.nextLink]
+        } else {
+            set permissions_url ""
+        }
+    }
+    return [list "ok" $permissions]
+}
+
+proc cli_path_to_item_id_and_dict {path access_token} {
+    # Consolidated CLI lookup function - gets item ID and dict from path
+    # Returns: {item_id item_dict} on success, empty list on failure
+    # Handles all error messaging internally
+    # THIS FUNCTION ONLY EXISTS IN CLI MODE - CANNOT BE CALLED FROM GUI
+    
+    # Build item URL from path (inlined from get_item_url_from_path)
+    if {$path eq "/" || $path eq ""} {
+        set item_url [build_graph_api_url "/me/drive/root"]
+    } else {
+        set encoded_path [url_encode $path]
+        set item_url [build_graph_api_url "/me/drive/root:/$encoded_path"]
+    }
+    
+    set headers [list Authorization "Bearer $access_token"]
+    set result [make_http_request $item_url $headers]
+    set status [lindex $result 0]
+    set data [lindex $result 1]
+    
+    if {$status ne "200"} {
+        puts "❌ Failed to get item: $status"
+        return {}
+    }
+    
+    set item_dict [json::json2dict $data]
+    set item_id [dict get $item_dict id]
+    
+    return [list $item_id $item_dict]
+}
+
+proc cli_resolve_path_for_command {path remote_name} {
+    # Helper function to resolve path to item ID for CLI commands
+    # Handles token retrieval and all error cases
+    # Returns: {access_token item_id item_dict} on success, empty list on failure
+    # On failure, prints error message and returns empty list (caller should exit)
+    
+    # Get access token
+    set access_token [get_access_token $remote_name]
+    if {$access_token eq ""} {
+        puts "❌ Failed to get access token"
+        return {}
+    }
+    
+    # Resolve path to item ID
+    set item_result [cli_path_to_item_id_and_dict $path $access_token]
+    if {[llength $item_result] == 0} {
+        puts "❌ Failed to resolve path: $path"
+        return {}
+    }
+    
+    lassign $item_result item_id item_dict
+    return [list $access_token $item_id $item_dict]
+}
+
+proc fetch_permissions_by_id {item_id access_token} {
+    # Get permissions from Microsoft Graph API
+    set permissions_url [build_graph_api_url "/me/drive/items/$item_id/permissions"]
+    
+    set result [make_http_request $permissions_url [list Authorization "Bearer $access_token"]]
+    set status [lindex $result 0]
+    set data [lindex $result 1]
+    
+    if {$status ne "200"} {
+        if {$status eq "403"} {
+            return [list "error" "Access denied - you may not have permission to view ACL for this item"]
+        } else {
+            return [list "error" "Failed to get ACL: $status"]
+        }
+    }
+    
+    # Parse permissions response
+    if {[catch {json::json2dict $data} permissions_dict]} {
+        return [list "error" "Failed to parse permissions response: $permissions_dict"]
+    }
+    
+    set permissions [dict get $permissions_dict value]
+    return [list "ok" $permissions]
+}
