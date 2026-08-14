@@ -338,51 +338,104 @@ proc audit_cli {policy_path format remote_name {platform_filter ""}} {
     return 0
 }
 
-proc enforce_folder {provider ctx fid fentry dry_run} {
-    # Bring one folder to its expected ACL.
-    # Returns {status changed_something violations_left} where status is
-    # ok | warning | error
-    lassign [audit_folder $provider $ctx $fid $fentry] violations live item_dict
-    set rel_path [dict get $fentry path]
+proc enforce_log {msg} {
+    # Enforcement progress. The command line prints it; a GUI can route it
+    # into its own log by setting ::enforce_log_cmd to a command prefix.
+    if {![info exists ::enforce_log_cmd] || $::enforce_log_cmd eq ""} {
+        puts $msg
+    } else {
+        uplevel #0 [list {*}$::enforce_log_cmd $msg]
+    }
+}
 
+proc enforce_actions {fid fentry violations {only {}}} {
+    # The plan for one folder, as action dicts {verb path email role detail}
+    # with verb invite | reinvite | remove | sever. only, a list of
+    # {email type} pairs, restricts the plan to the named findings; empty
+    # covers them all. reinvite implies removal first: a wrong role is
+    # fixed by remove-and-invite, there is no in-place role change.
+    set rel_path [dict get $fentry path]
     set to_add {}
     set to_fix {}
     set to_remove {}
     foreach v $violations {
+        if {[llength $only] > 0 && \
+            [list [dict get $v email] [dict get $v type]] ni $only} { continue }
         switch [dict get $v type] {
             missing_user      { dict set to_add [dict get $v email] [dict get $v expected] }
             wrong_role        { dict set to_fix [dict get $v email] [dict get $v expected] }
-            extra_user -
-            leaked_inherited  { dict set to_remove [dict get $v email] [dict get $v actual] }
-            not_found -
-            error             { return [list error 0 $violations] }
+            extra_user        { dict set to_remove [dict get $v email] remove }
+            leaked_inherited  { dict set to_remove [dict get $v email] sever }
         }
     }
+    set actions {}
+    dict for {email role} $to_add {
+        lappend actions [dict create verb invite path $rel_path email $email role $role detail ""]
+    }
+    dict for {email role} $to_fix {
+        lappend actions [dict create verb reinvite path $rel_path email $email role $role detail ""]
+    }
+    dict for {email verb} $to_remove {
+        lappend actions [dict create verb $verb path $rel_path email $email role "" detail ""]
+    }
+    return $actions
+}
 
-    if {[dict size $to_add] == 0 && [dict size $to_fix] == 0 && [dict size $to_remove] == 0} {
-        return [list ok 0 {}]
+proc enforce_folder {provider ctx fid fentry dry_run {only {}}} {
+    # Bring one folder to its expected ACL (or the only-listed findings).
+    # Returns {status changed_something violations_left actions} where
+    # status is ok | warning | error
+    lassign [audit_folder $provider $ctx $fid $fentry] violations live item_dict
+    set rel_path [dict get $fentry path]
+
+    foreach v $violations {
+        if {[dict get $v type] in {not_found error}} {
+            return [list error 0 $violations {}]
+        }
+    }
+    set actions [enforce_actions $fid $fentry $violations $only]
+
+    if {[llength $actions] == 0} {
+        return [list ok 0 {} {}]
     }
 
     if {$dry_run} {
-        dict for {email role} $to_add { puts "  \[dry-run\] would invite $email ($role) to $rel_path" }
-        dict for {email role} $to_fix { puts "  \[dry-run\] would re-invite $email as $role on $rel_path" }
-        dict for {email role} $to_remove { puts "  \[dry-run\] would remove $email from $rel_path" }
-        return [list ok 0 {}]
+        foreach a $actions {
+            set email [dict get $a email]
+            switch [dict get $a verb] {
+                invite   { enforce_log "  \[dry-run\] would invite $email ([dict get $a role]) to $rel_path" }
+                reinvite { enforce_log "  \[dry-run\] would re-invite $email as [dict get $a role] on $rel_path" }
+                remove -
+                sever    { enforce_log "  \[dry-run\] would remove $email from $rel_path" }
+            }
+        }
+        return [list ok 0 {} $actions]
     }
 
-    set removal_emails [concat [dict keys $to_remove] [dict keys $to_fix]]
+    set to_add {}
+    set to_fix {}
+    set removal_emails {}
+    foreach a $actions {
+        set email [dict get $a email]
+        switch [dict get $a verb] {
+            invite   { dict set to_add $email [dict get $a role] }
+            reinvite { dict set to_fix $email [dict get $a role]; lappend removal_emails $email }
+            remove -
+            sever    { lappend removal_emails $email }
+        }
+    }
     set moved 0
 
     if {[llength $removal_emails] > 0} {
         lassign [{*}[dict get $provider remove] $ctx $fid $removal_emails] removed blocked
-        foreach email $removed { puts "  ✂️  removed $email" }
+        foreach email $removed { enforce_log "  ✂️  removed $email" }
         if {[llength $blocked] > 0} {
             # Inherited access resists in-place removal; the provider's
             # sever operation detaches the folder from its source and
             # plants the effective ACL explicitly.
             lassign [{*}[dict get $provider sever] $ctx $fid $fentry $item_dict $blocked] sstatus schanged
             if {$sstatus ne "ok"} {
-                return [list error $schanged $violations]
+                return [list error $schanged $violations $actions]
             }
             set moved 1
         }
@@ -393,25 +446,25 @@ proc enforce_folder {provider ctx fid fentry dry_run} {
         dict for {email role} $to_add {
             lassign [{*}[dict get $provider invite] $ctx $fid $email $role] istatus imsg
             if {$istatus eq "ok"} {
-                puts "  ➕ invited $email ($role)"
+                enforce_log "  ➕ invited $email ($role)"
             } elseif {$istatus eq "ok-notified"} {
-                puts "  ➕ invited $email ($role); ⚠️ notification email was sent"
+                enforce_log "  ➕ invited $email ($role); ⚠️ notification email was sent"
             } elseif {$istatus eq "unenforceable"} {
-                puts "  ⛔ $email: $imsg"
+                enforce_log "  ⛔ $email: $imsg"
                 dict set unenforceable $email 1
             } else {
-                puts "  ❌ invite $email failed: $imsg"
+                enforce_log "  ❌ invite $email failed: $imsg"
             }
         }
         dict for {email role} $to_fix {
             lassign [{*}[dict get $provider invite] $ctx $fid $email $role] istatus imsg
             if {$istatus in {ok ok-notified}} {
-                puts "  🔁 re-invited $email as $role"
+                enforce_log "  🔁 re-invited $email as $role"
             } elseif {$istatus eq "unenforceable"} {
-                puts "  ⛔ $email: $imsg"
+                enforce_log "  ⛔ $email: $imsg"
                 dict set unenforceable $email 1
             } else {
-                puts "  ❌ re-invite $email failed: $imsg"
+                enforce_log "  ❌ re-invite $email failed: $imsg"
             }
         }
     }
@@ -431,15 +484,15 @@ proc enforce_folder {provider ctx fid fentry dry_run} {
         }
         if {[llength $remaining] == 0} {
             if {[dict size $unenforceable] > 0} {
-                puts "  ✅ verified ([dict size $unenforceable] grant(s) unenforceable on the current plan, listed above)"
+                enforce_log "  ✅ verified ([dict size $unenforceable] grant(s) unenforceable on the current plan, listed above)"
             } else {
-                puts "  ✅ verified"
+                enforce_log "  ✅ verified"
             }
-            return [list ok 1 {}]
+            return [list ok 1 {} $actions]
         }
     }
-    puts "  ⚠️  still differs after enforcement"
-    return [list warning 1 $remaining]
+    enforce_log "  ⚠️  still differs after enforcement"
+    return [list warning 1 $remaining $actions]
 }
 
 proc plans_filtered {model platform_filter} {

@@ -669,24 +669,24 @@ proc od_sever {ctx fid fentry item_dict blocked} {
     # Returns {status changed}, status ok | error; changed once the move
     # has happened, whatever came after.
     set token [dict get $ctx token]
-    puts "  🚚 inherited permissions on [join $blocked {, }]: moving folder to root to sever inheritance"
+    enforce_log "  🚚 inherited permissions on [join $blocked {, }]: moving folder to root to sever inheritance"
     if {![dict exists $item_dict parentReference id]} {
         return [list error 0]
     }
     set original_parent [dict get $item_dict parentReference id]
     lassign [move_item $fid [dict get $ctx root_id] $token] mstatus mmsg
     if {$mstatus ne "ok"} {
-        puts "  ❌ move failed: $mmsg"
+        enforce_log "  ❌ move failed: $mmsg"
         return [list error 0]
     }
     after 2000
     lassign [enforce_remove_emails $fid $blocked $token] removed2 blocked2
-    foreach email $removed2 { puts "  ✂️  removed $email (after move)" }
-    foreach email $blocked2 { puts "  ❌ still cannot remove $email" }
+    foreach email $removed2 { enforce_log "  ✂️  removed $email (after move)" }
+    foreach email $blocked2 { enforce_log "  ❌ still cannot remove $email" }
 
     lassign [get_folder_permissions $fid $token] pstatus perms_now
     if {$pstatus ne "ok"} {
-        puts "  ❌ cannot read permissions at root; leaving folder in place"
+        enforce_log "  ❌ cannot read permissions at root; leaving folder in place"
     } else {
         set live_now [extract_users_from_permissions $perms_now]
         dict for {email role} [dict get $fentry effective] {
@@ -694,17 +694,17 @@ proc od_sever {ctx fid fentry item_dict blocked} {
                 ([dict get $live_now $email] eq $role || [dict get $live_now $email] eq "write")} { continue }
             lassign [invite_user_to_item $fid $email $role $token 1] istatus imsg
             if {$istatus eq "ok"} {
-                puts "  🌱 planted $email ($role)"
+                enforce_log "  🌱 planted $email ($role)"
             } elseif {$istatus eq "ok-notified"} {
-                puts "  🌱 planted $email ($role); ⚠️ notification email was sent"
+                enforce_log "  🌱 planted $email ($role); ⚠️ notification email was sent"
             } else {
-                puts "  ❌ plant $email failed: $imsg"
+                enforce_log "  ❌ plant $email failed: $imsg"
             }
         }
     }
     lassign [move_item $fid $original_parent $token] mstatus mmsg
     if {$mstatus ne "ok"} {
-        puts "  ❌ MOVE BACK FAILED: $mmsg  (folder is sitting at the drive root)"
+        enforce_log "  ❌ MOVE BACK FAILED: $mmsg  (folder is sitting at the drive root)"
         return [list error 1]
     }
     after 2000

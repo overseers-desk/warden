@@ -809,7 +809,7 @@ proc dbx_remove {ctx fid emails} {
         }
         if {[dict exists $resp .tag] && [dict get $resp .tag] eq "async_job_id"} {
             if {[catch {dbx_wait_remove_job $token [dict get $resp async_job_id]} jerr]} {
-                puts "  ❌ remove $email: $jerr"
+                enforce_log "  ❌ remove $email: $jerr"
                 lappend blocked $email
                 continue
             }
@@ -854,6 +854,6 @@ proc dbx_sever {ctx fid fentry item_dict blocked} {
     if {$anc ne ""} {
         catch {set where [dict get [dbx_folder_meta $token $anc] path_display]}
     }
-    puts "  ⛔ [join $blocked {, }]: access is inherited from $where; fix it there (remove the member, or relocate this folder out of the share for good)"
+    enforce_log "  ⛔ [join $blocked {, }]: access is inherited from $where; fix it there (remove the member, or relocate this folder out of the share for good)"
     return [list error 0]
 }
