@@ -4733,6 +4733,7 @@ proc main {argc argv} {
         {set-caption.arg "\x00" "Set the item's caption/description (searchable in OneDrive); use \"\" to clear"}
         {audit.arg "" "Audit live ACLs against a POLICY yaml file (read-only)"}
         {enforce.arg "" "Audit then fix live ACLs to match a POLICY yaml file"}
+        {convert-policy.arg "" "Print the version-2 form of an email-per-member POLICY yaml file"}
         {r "Include children in scan (recursive, default depth: 3)"}
         {recursive "Include children in scan (recursive, default depth: 3)"}
         {max-depth.arg "0" "Max depth (default: 3 with -r, 0 otherwise)"}
@@ -4771,6 +4772,7 @@ proc main {argc argv} {
     set caption $params(set-caption)
     set audit_policy $params(audit)
     set enforce_policy $params(enforce)
+    set convert_policy $params(convert-policy)
     set item_type $params(type)
     set output_format $params(format)
     set dry_run $params(dry-run)
@@ -4802,10 +4804,21 @@ proc main {argc argv} {
     if {$caption ne "\x00"} { incr action_count }
     if {$audit_policy ne ""} { incr action_count }
     if {$enforce_policy ne ""} { incr action_count }
+    if {$convert_policy ne ""} { incr action_count }
 
     if {$action_count > 1} {
-        puts "Error: --only-user, --remove-user, --invite, --set-caption, --audit, and --enforce are mutually exclusive"
+        puts "Error: --only-user, --remove-user, --invite, --set-caption, --audit, --enforce, and --convert-policy are mutually exclusive"
         exit 1
+    }
+
+    # Conversion is pure text transformation: no drive, no token
+    if {$convert_policy ne ""} {
+        source [file join [file dirname [file normalize [info script]]] lib policy.tcl]
+        if {[catch {puts -nonewline [policy_convert_v1_v2 $convert_policy]} err]} {
+            puts stderr "❌ Policy error: $err"
+            exit 2
+        }
+        exit 0
     }
 
     # Policy modes take their folder set from the policy file

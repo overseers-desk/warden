@@ -1,0 +1,153 @@
+# Loader behaviour that only shows on a two-platform policy: per-platform
+# plans, unreachable grants, identity resolution, multi-account people.
+# Run: tclsh9.0 tests/policy-v2.test
+
+package require tcltest
+namespace import ::tcltest::*
+
+set here [file dirname [file normalize [info script]]]
+source [file join [file dirname $here] lib policy.tcl]
+
+set fixture [makeFile {
+version: 2
+people:
+  ana:
+    name: Ana Example
+    relationship: employee
+    reason: bookkeeping
+    accounts:
+      onedrive: ana@corp.example
+      dropbox: [ana.p@gmail.example, ana@old.example]
+  ben:
+    name: Ben Example
+    relationship: contractor
+    reason: site works
+    accounts:
+      onedrive: ben@build.example
+  cleo:
+    name: Cleo Example
+    relationship: contractor
+    reason: accounts
+    accounts:
+      dropbox: cleo@ledger.example
+groups:
+  staff: {members: [ana, ben]}
+  accountants: {members: [cleo]}
+  everyone:
+    includes: [staff, accountants]
+collections:
+  finance:
+    closed: true
+    folders:
+      - {platform: onedrive, path: "/Corp/Finance", id: "OD!1"}
+      - {platform: dropbox,  path: "/Finance",      id: "id:DB1"}
+  finance-sub:
+    folders:
+      - {platform: dropbox, path: "/Finance/2026", id: "id:DB2"}
+  projects:
+    folders:
+      - {platform: onedrive, path: "/Corp/Projects", id: "OD!2"}
+grants:
+  - {collection: finance, group: accountants, roles: [write]}
+  - {collection: finance-sub, group: staff, roles: [read]}
+  - {collection: projects, group: everyone, roles: [read, write]}
+} policy-v2-fixture.yaml]
+
+set model [policy_load_v2 $fixture]
+
+test plan-per-platform {folders land under their platform} -body {
+    list [lsort [dict keys [dict get $model plan onedrive]]] \
+         [lsort [dict keys [dict get $model plan dropbox]]]
+} -result {{OD!1 OD!2} {id:DB1 id:DB2}}
+
+test multi-account-expansion {each dropbox address of a person is expected} -body {
+    dict get $model plan dropbox id:DB2 expected
+} -result {ana.p@gmail.example read ana@old.example read}
+
+test unreachable-grant {a grant on a platform the person has no account on warns} -body {
+    set w [lindex [dict get $model warnings] 0]
+    list [dict get $w type] [dict get $w person] [dict get $w platform]
+} -result {unreachable_grant cleo onedrive}
+
+test unreachable-not-violation {the unreachable person is absent from expected} -body {
+    dict exists [dict get $model plan onedrive OD!1 expected] cleo
+} -result 0
+
+test closed-hermetic {a closed folder absorbs no ancestor grants} -body {
+    dict get $model plan dropbox id:DB1 expected
+} -result {cleo@ledger.example write}
+
+test inheritance-within-platform {an open folder absorbs its policy ancestor} -body {
+    dict get $model plan dropbox id:DB2 effective
+} -result {ana.p@gmail.example read ana@old.example read cleo@ledger.example write}
+
+test no-cross-platform-inheritance {onedrive paths do not feed dropbox effective} -body {
+    dict exists [dict get $model plan onedrive OD!2 effective] cleo@ledger.example
+} -result 0
+
+test write-beats-read {roles listing read and write settle on write} -body {
+    dict get $model plan onedrive OD!2 expected ben@build.example
+} -result write
+
+test collection-label {a plan entry names its defining collection} -body {
+    dict get $model plan dropbox id:DB2 collection
+} -result finance-sub
+
+test identity-lookup {an account email resolves to its person} -body {
+    identity_person_for $model dropbox ANA.P@GMAIL.EXAMPLE
+} -result ana
+
+test identity-display {a person renders by name} -body {
+    identity_display $model ana
+} -result {Ana Example}
+
+test identity-unmapped {emails the policy does not know fall out} -body {
+    identity_unmapped $model dropbox {cleo@ledger.example stranger@x.example}
+} -result stranger@x.example
+
+test unknown-person-errors {a group naming a missing person fails to load} -body {
+    set bad [makeFile {
+version: 2
+people:
+  ana: {name: Ana, accounts: {onedrive: a@x.example}}
+groups:
+  g: {members: [nobody]}
+collections:
+  c:
+    folders: [{platform: onedrive, path: "/X", id: "OD!9"}]
+grants:
+  - {collection: c, group: g, roles: [read]}
+} bad-person.yaml]
+    catch {policy_load_v2 $bad} err
+    set err
+} -result {group 'g' names unknown person 'nobody'}
+
+test duplicate-account-errors {one email owned by two people fails to load} -body {
+    set bad [makeFile {
+version: 2
+people:
+  ana: {name: Ana, accounts: {onedrive: same@x.example}}
+  ben: {name: Ben, accounts: {onedrive: same@x.example}}
+groups:
+  g: {members: [ana, ben]}
+collections:
+  c:
+    folders: [{platform: onedrive, path: "/X", id: "OD!9"}]
+grants:
+  - {collection: c, group: g, roles: [read]}
+} dup-account.yaml]
+    catch {policy_load_v2 $bad} err
+    set err
+} -result {account 'same@x.example' on onedrive belongs to both 'ana' and 'ben'}
+
+test version-required {a policy without version 2 is refused} -body {
+    set bad [makeFile {
+groups: {}
+collections: {}
+grants: []
+} no-version.yaml]
+    catch {policy_load_v2 $bad} err
+    string match "policy is not version 2*" $err
+} -result 1
+
+cleanupTests
