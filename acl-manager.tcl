@@ -311,12 +311,15 @@ proc ::ui::build_addressbar {} {
 proc ::ui::build_browser {} {
     variable w
 
-    # LEFT PANE: Browser
-    set left_frame [ttk::frame $w(paned).browser]
-    $w(paned) add $left_frame -weight 1
-
-    ttk::label $left_frame.label -text "Folders:"
-    pack $left_frame.label -anchor w -pady {0 5}
+    # LEFT PANE: a notebook of Folders / Groups
+    set w(nb_left) [ttk::notebook $w(paned).left]
+    $w(paned) add $w(nb_left) -weight 1
+    set left_frame [ttk::frame $w(nb_left).folders]
+    $w(nb_left) add $left_frame -text "Folders"
+    ::ui::build_groups_view
+    bind $w(nb_left) <<NotebookTabChanged>> {
+        if {[$::ui::w(nb_left) select] eq $::ui::w(tab_groups)} { ::ui::groups_render }
+    }
 
     # Create treeview with scrollbars
     pack [ttk::scrollbar $left_frame.hscroll -orient horizontal -command "$left_frame.tree xview"] -side bottom -fill x
@@ -333,6 +336,23 @@ proc ::ui::build_browser {} {
     $w(tree) heading #0 -text "Folder"
     $w(tree) heading badge -text "Policy"
     $w(tree) column badge -width 60 -stretch 0 -anchor center
+
+    # Right-click: the item id, ready to paste into a policy folder entry
+    set w(tree_menu) [menu $left_frame.tree.menu -tearoff 0]
+    $w(tree_menu) add command -label "Copy item id" -command {
+        set sel [$::ui::w(tree) selection]
+        if {$sel ne ""} {
+            copy_to_clipboard [lindex [$::ui::w(tree) item [lindex $sel 0] -values] 0]
+            ::ui::status "Item id copied" blue
+        }
+    }
+    bind $w(tree) <Button-3> {
+        set item [%W identify item %x %y]
+        if {$item ne ""} {
+            %W selection set $item
+            tk_popup $::ui::w(tree_menu) %X %Y
+        }
+    }
 
     # Bind events for selection and expansion
     bind $w(tree) <<TreeviewSelect>> {on_tree_select $::ui::w(tree)}
@@ -370,6 +390,83 @@ proc ::ui::build_browser {} {
     }
 }
 
+proc ::ui::build_groups_view {} {
+    variable w
+    set t [ttk::frame $w(nb_left).groups]
+    set w(tab_groups) $t
+    $w(nb_left) add $t -text "Groups"
+    pack [ttk::scrollbar $t.vs -orient vertical -command "$t.list yview"] -side right -fill y
+    set w(gtree) [ttk::treeview $t.list -columns {badge} -show {tree headings} \
+        -selectmode browse -yscrollcommand "$t.vs set"]
+    $w(gtree) heading #0 -text "Group → collection → folder"
+    $w(gtree) heading badge -text "Role"
+    $w(gtree) column badge -width 70 -stretch 0 -anchor center
+    $w(gtree) tag configure grp -background gray92
+    $w(gtree) tag configure write -background lightblue
+    $w(gtree) tag configure read -background lightyellow
+    pack $w(gtree) -fill both -expand yes
+    bind $w(gtree) <<TreeviewSelect>> ::ui::groups_view_selected
+}
+
+proc ::ui::groups_render {} {
+    # Group -> its grants -> the granted collections' folders
+    variable w
+    variable state
+    if {![info exists state(model)] || $state(model) eq ""} { return }
+    set model $state(model)
+    set raw [dict get $model raw]
+    foreach row [$w(gtree) children {}] { $w(gtree) delete $row }
+    foreach gname [lsort [dict keys [dict get $raw groups]]] {
+        set n [llength [policy_v2_resolve_group [dict get $raw groups] $gname {}]]
+        set grants {}
+        foreach grant [dict get $raw grants] {
+            if {[dict get $grant group] eq $gname} { lappend grants $grant }
+        }
+        set people_word [expr {$n == 1 ? "person" : "people"}]
+        set grants_word [expr {[llength $grants] == 1 ? "grant" : "grants"}]
+        set grow [$w(gtree) insert {} end -text "$gname  ($n $people_word)" \
+            -values [list "[llength $grants] $grants_word"] -tags grp]
+        foreach grant $grants {
+            set cname [dict get $grant collection]
+            set role "read"
+            foreach r [dict get $grant roles] { if {$r eq "write"} { set role "write" } }
+            set where ""
+            catch {set where [join [dict get $model collections $cname platforms] " + "]}
+            set crow [$w(gtree) insert $grow end -text "$cname — $where" \
+                -values [list $role] -tags $role]
+            catch {
+                foreach f [dict get $model collections $cname folders] {
+                    set platform [dict get $f platform]
+                    set fid [dict get $f id]
+                    $w(gtree) insert $crow end \
+                        -text [file tail [dict get $f path]] \
+                        -values [list [::ui::badge_for $platform $fid]] \
+                        -tags [list folder_ref $platform $fid]
+                }
+            }
+        }
+    }
+}
+
+proc ::ui::groups_view_selected {} {
+    # A folder row jumps to the Access tab with that folder's ACL
+    variable w
+    variable state
+    set sel [$w(gtree) selection]
+    if {$sel eq ""} { return }
+    set tags [$w(gtree) item [lindex $sel 0] -tags]
+    if {[lindex $tags 0] ne "folder_ref"} { return }
+    lassign $tags _ platform fid
+    set state(sel_provider) $platform
+    set ::selected_item [dict create id $fid is_folder 1 provider $platform]
+    $w(nb_right) select $w(tab_access)
+    if {$platform eq "dropbox"} {
+        gui_fetch_acl_dropbox $fid
+    } else {
+        gui_fetch_acl $fid [$w(remote_entry) get]
+    }
+}
+
 proc ::ui::build_acl_pane {} {
     variable w
 
@@ -379,13 +476,10 @@ proc ::ui::build_acl_pane {} {
     set right_frame [ttk::frame $w(nb_right).access]
     set w(tab_access) $right_frame
     $w(nb_right) add $right_frame -text "Access"
-    foreach {name title} {policy Policy people People} {
-        set w(tab_$name) [ttk::frame $w(nb_right).$name]
-        $w(nb_right) add $w(tab_$name) -text $title
-        pack [ttk::label $w(tab_$name).todo -text "(built in a later step this wave)" \
-            -foreground gray50] -expand yes
-    }
+    ::ui::build_policy_tab
+    ::ui::build_people_tab
     ::ui::build_audit_tab
+    bind $w(nb_right) <<NotebookTabChanged>> ::ui::tab_changed
 
     # Set initial sash position after window is mapped (gives 35% to left, 65% to right)
     bind $w(paned) <Map> {
@@ -493,6 +587,593 @@ proc ::ui::build_acl_pane {} {
 
     pack $w(btn_remove) -side left -padx 2
     pack $w(btn_invite) -side left -padx 2
+}
+
+proc ::ui::tab_changed {} {
+    # Model-backed tabs redraw from the current model on entry
+    variable w
+    variable state
+    if {![info exists state(model)] || $state(model) eq ""} { return }
+    set cur [$w(nb_right) select]
+    if {$cur eq $w(tab_policy)} { ::ui::policy_render }
+    if {$cur eq $w(tab_people)} { ::ui::people_render }
+}
+
+proc ::ui::invite_into_policy {email role group collection platform} {
+    # Mirror a drive invite into the policy: the account joins a person
+    # (found or created), the person joins the group, and the group holds
+    # a grant on the collection at least as strong as the invite.
+    variable state
+    set email [string tolower $email]
+    set model $state(model)
+    set slug [identity_person_for $model $platform $email]
+    set raw [dict get $model raw]
+    if {$slug eq ""} {
+        set slug [policy_slugify [lindex [split $email @] 0]]
+        if {[dict exists $raw people $slug]} {
+            set accounts {}
+            catch {set accounts [dict get $raw people $slug accounts $platform]}
+            lappend accounts $email
+            dict set raw people $slug accounts $platform $accounts
+        } else {
+            dict set raw people $slug [dict create name $slug \
+                accounts [dict create $platform [list $email]]]
+        }
+    }
+    set members {}
+    catch {set members [dict get $raw groups $group members]}
+    if {$slug ni $members} {
+        lappend members $slug
+        dict set raw groups $group members $members
+    }
+    if {$collection ne ""} {
+        set have 0
+        foreach grant [dict get $raw grants] {
+            if {[dict get $grant group] ne $group || [dict get $grant collection] ne $collection} { continue }
+            set grole "read"
+            foreach r [dict get $grant roles] { if {$r eq "write"} { set grole "write" } }
+            if {$grole eq "write" || $grole eq $role} { set have 1; break }
+        }
+        if {!$have} {
+            set grants [dict get $raw grants]
+            lappend grants [dict create collection $collection group $group roles [list $role]]
+            dict set raw grants $grants
+        }
+    }
+    if {[catch {policy_save $state(policy_path) $raw} err]} {
+        ::ui::status $err red
+        return
+    }
+    ::ui::policy_open $state(policy_path)
+    ::ui::status "Invite written into the policy ($slug in $group)" blue
+}
+
+proc ::ui::build_policy_tab {} {
+    variable w
+    set t [ttk::frame $w(nb_right).policy]
+    set w(tab_policy) $t
+    $w(nb_right) add $t -text "Policy"
+
+    # Top: groups list beside the selected group's members
+    pack [ttk::frame $t.top] -fill both -expand yes -padx 4 -pady {6 2}
+    pack [ttk::frame $t.top.g] -side left -fill y -padx {0 8}
+    pack [ttk::label $t.top.g.head -text "Groups" -font TkHeadingFont] -anchor w
+    set w(groups) [ttk::treeview $t.top.g.list -columns {count} -show tree -height 12 -selectmode browse]
+    $w(groups) column #0 -width 170
+    $w(groups) column count -width 60 -anchor e
+    pack $w(groups) -fill y -expand yes
+    bind $w(groups) <<TreeviewSelect>> ::ui::policy_group_selected
+    pack [ttk::frame $t.top.g.btn] -fill x -pady 3
+    pack [ttk::button $t.top.g.btn.new -text "New group" -command ::ui::group_new] -side left
+    pack [ttk::button $t.top.g.btn.del -text "Delete" -command ::ui::group_delete] -side left -padx 3
+
+    pack [ttk::frame $t.top.m] -side left -fill both -expand yes
+    set w(members_head) [ttk::label $t.top.m.head -text "Members" -font TkHeadingFont]
+    pack $w(members_head) -anchor w
+    set w(members) [ttk::treeview $t.top.m.list \
+        -columns {name relationship accounts reason} -show {tree headings} -height 12 -selectmode browse]
+    configure_tree_columns $w(members) {
+        #0 "Person" 120 80
+        name "Name" 130 90
+        relationship "Relationship" 110 80
+        accounts "Accounts" 150 100
+        reason "Reason" 220 120
+    }
+    pack $w(members) -fill both -expand yes
+    pack [ttk::frame $t.top.m.btn] -fill x -pady 3
+    pack [ttk::button $t.top.m.btn.add -text "Add member…" -command ::ui::member_add] -side left
+    pack [ttk::button $t.top.m.btn.rm -text "Remove" -command ::ui::member_remove] -side left -padx 3
+    pack [ttk::button $t.top.m.btn.yaml -text "View YAML…" -command ::ui::policy_view_yaml] -side right
+
+    # Bottom: collections beside the selected group's grants
+    pack [ttk::frame $t.bot] -fill both -padx 4 -pady {2 6}
+    pack [ttk::frame $t.bot.c] -side left -fill both -expand yes -padx {0 8}
+    pack [ttk::label $t.bot.c.head -text "Collections" -font TkHeadingFont] -anchor w
+    set w(collections) [ttk::treeview $t.bot.c.list \
+        -columns {where folders closed} -show {tree headings} -height 6 -selectmode browse]
+    configure_tree_columns $w(collections) {
+        #0 "Name" 160 100
+        where "Where" 150 90
+        folders "Folders" 60 40
+        closed "Closed" 60 40
+    }
+    $w(collections) column folders -anchor center
+    $w(collections) column closed -anchor center
+    pack $w(collections) -fill both -expand yes
+
+    pack [ttk::frame $t.bot.gr] -side left -fill both -expand yes
+    set w(grants_head) [ttk::label $t.bot.gr.head -text "Grants" -font TkHeadingFont]
+    pack $w(grants_head) -anchor w
+    set w(grants) [ttk::treeview $t.bot.gr.list \
+        -columns {role} -show {tree headings} -height 6 -selectmode browse]
+    configure_tree_columns $w(grants) {
+        #0 "Collection" 200 120
+        role "Role" 70 50
+    }
+    $w(grants) column role -anchor center
+    $w(grants) tag configure write -background lightblue
+    $w(grants) tag configure read -background lightyellow
+    pack $w(grants) -fill both -expand yes
+    pack [ttk::frame $t.bot.gr.btn] -fill x -pady 3
+    pack [ttk::button $t.bot.gr.btn.add -text "Add grant…" -command ::ui::grant_add] -side left
+    pack [ttk::button $t.bot.gr.btn.rm -text "Remove grant" -command ::ui::grant_remove] -side left -padx 3
+}
+
+proc ::ui::policy_render {} {
+    variable w
+    variable state
+    set model $state(model)
+    set prev ""
+    catch {set prev [$w(groups) item [lindex [$w(groups) selection] 0] -text]}
+    foreach row [$w(groups) children {}] { $w(groups) delete $row }
+    set raw [dict get $model raw]
+    foreach gname [lsort [dict keys [dict get $raw groups]]] {
+        set n [llength [policy_v2_resolve_group [dict get $raw groups] $gname {}]]
+        set row [$w(groups) insert {} end -text $gname -values [list "$n ppl"]]
+        if {$gname eq $prev} { $w(groups) selection set $row }
+    }
+    foreach row [$w(collections) children {}] { $w(collections) delete $row }
+    dict for {cname c} [dict get $model collections] {
+        $w(collections) insert {} end -text $cname -values [list \
+            [join [dict get $c platforms] " + "] \
+            [llength [dict get $c folders]] \
+            [expr {[dict get $c closed] ? "☑" : "☐"}]]
+    }
+    if {[$w(groups) selection] eq "" && [$w(groups) children {}] ne ""} {
+        $w(groups) selection set [lindex [$w(groups) children {}] 0]
+    }
+    ::ui::policy_group_selected
+}
+
+proc ::ui::policy_group_selected {} {
+    variable w
+    variable state
+    if {![info exists state(model)] || $state(model) eq ""} { return }
+    set sel [$w(groups) selection]
+    if {$sel eq ""} { return }
+    set gname [$w(groups) item [lindex $sel 0] -text]
+    set model $state(model)
+    set raw [dict get $model raw]
+    $w(members_head) configure -text "Members of $gname"
+    $w(grants_head) configure -text "Grants to $gname"
+    foreach row [$w(members) children {}] { $w(members) delete $row }
+    set g [dict get $raw groups $gname]
+    set direct {}
+    if {[dict exists $g members]} { set direct [dict get $g members] }
+    foreach slug [policy_v2_resolve_group [dict get $raw groups] $gname {}] {
+        set p [dict get $model people $slug]
+        set accounts {}
+        dict for {platform emails} [dict get $p accounts] {
+            lappend accounts "$platform: [join $emails {, }]"
+        }
+        set via [expr {$slug in $direct ? "" : " (via include)"}]
+        $w(members) insert {} end -text $slug$via -values [list \
+            [expr {[dict exists $p name] ? [dict get $p name] : ""}] \
+            [expr {[dict exists $p relationship] ? [dict get $p relationship] : ""}] \
+            [join $accounts "; "] \
+            [expr {[dict exists $p reason] ? [dict get $p reason] : ""}]]
+    }
+    foreach row [$w(grants) children {}] { $w(grants) delete $row }
+    foreach grant [dict get $raw grants] {
+        if {[dict get $grant group] ne $gname} { continue }
+        set role "read"
+        foreach r [dict get $grant roles] { if {$r eq "write"} { set role "write" } }
+        $w(grants) insert {} end -text [dict get $grant collection] \
+            -values [list $role] -tags $role
+    }
+}
+
+proc ::ui::policy_mutate {script} {
+    # Run a raw-dict mutation, save with the load-validate guard, reload
+    variable state
+    if {![info exists state(model)] || $state(model) eq ""} {
+        ::ui::status "Open a policy first" red
+        return 0
+    }
+    set raw [dict get $state(model) raw]
+    if {[catch {uplevel 1 [list apply {{raw script} {
+        eval $script
+        return $raw
+    }} $raw $script]} raw2]} {
+        ::ui::status "Edit failed: $raw2" red
+        return 0
+    }
+    if {[catch {policy_save $state(policy_path) $raw2} err]} {
+        ::ui::status $err red
+        return 0
+    }
+    ::ui::policy_open $state(policy_path)
+    ::ui::policy_render
+    return 1
+}
+
+proc ::ui::ask_string {title prompt {initial ""}} {
+    # A modal one-line prompt; "" when cancelled
+    set top [toplevel .ask]
+    wm title $top $title
+    wm transient $top .
+    pack [ttk::label $top.l -text $prompt] -padx 12 -pady {12 4} -anchor w
+    set ::ui::ask_var $initial
+    pack [ttk::entry $top.e -textvariable ::ui::ask_var -width 40] -padx 12 -fill x
+    pack [ttk::frame $top.b] -pady 10
+    pack [ttk::button $top.b.ok -text "OK" -command {set ::ui::ask_done 1}] -side left -padx 4
+    pack [ttk::button $top.b.no -text "Cancel" -command {set ::ui::ask_done 0}] -side left
+    bind $top.e <Return> {set ::ui::ask_done 1}
+    grab $top
+    focus $top.e
+    vwait ::ui::ask_done
+    set result [expr {$::ui::ask_done ? $::ui::ask_var : ""}]
+    grab release $top
+    destroy $top
+    return [string trim $result]
+}
+
+proc ::ui::ask_choice {title prompt choices} {
+    # A modal combobox pick; "" when cancelled
+    set top [toplevel .askc]
+    wm title $top $title
+    wm transient $top .
+    pack [ttk::label $top.l -text $prompt] -padx 12 -pady {12 4} -anchor w
+    set ::ui::ask_var [lindex $choices 0]
+    pack [ttk::combobox $top.c -textvariable ::ui::ask_var -values $choices -state readonly -width 36] -padx 12
+    pack [ttk::frame $top.b] -pady 10
+    pack [ttk::button $top.b.ok -text "OK" -command {set ::ui::ask_done 1}] -side left -padx 4
+    pack [ttk::button $top.b.no -text "Cancel" -command {set ::ui::ask_done 0}] -side left
+    grab $top
+    vwait ::ui::ask_done
+    set result [expr {$::ui::ask_done ? $::ui::ask_var : ""}]
+    grab release $top
+    destroy $top
+    return $result
+}
+
+proc ::ui::group_new {} {
+    set name [::ui::ask_string "New group" "Group name (kebab-case):"]
+    if {$name eq ""} { return }
+    ::ui::policy_mutate [list dict set raw groups $name [dict create members {}]]
+}
+
+proc ::ui::group_delete {} {
+    variable w
+    variable state
+    set sel [$w(groups) selection]
+    if {$sel eq ""} { return }
+    set gname [$w(groups) item [lindex $sel 0] -text]
+    set raw [dict get $state(model) raw]
+    foreach grant [dict get $raw grants] {
+        if {[dict get $grant group] eq $gname} {
+            ::ui::status "Group '$gname' still has grants; remove them first" red
+            return
+        }
+    }
+    dict for {other g} [dict get $raw groups] {
+        if {[dict exists $g includes] && $gname in [dict get $g includes]} {
+            ::ui::status "Group '$gname' is included by '$other'; unhook it first" red
+            return
+        }
+    }
+    if {[tk_messageBox -type yesno -icon warning -title "Delete group" \
+        -message "Delete group '$gname'?"] ne "yes"} { return }
+    ::ui::policy_mutate [list dict unset raw groups $gname]
+}
+
+proc ::ui::member_add {} {
+    variable w
+    variable state
+    set sel [$w(groups) selection]
+    if {$sel eq ""} { return }
+    set gname [$w(groups) item [lindex $sel 0] -text]
+    set slugs [lsort [dict keys [dict get $state(model) people]]]
+    set slug [::ui::ask_choice "Add member" "Person to add to $gname:" $slugs]
+    if {$slug eq ""} { return }
+    set members {}
+    catch {set members [dict get $state(model) raw groups $gname members]}
+    if {$slug in $members} { return }
+    lappend members $slug
+    ::ui::policy_mutate [list dict set raw groups $gname members $members]
+}
+
+proc ::ui::member_remove {} {
+    variable w
+    variable state
+    set gsel [$w(groups) selection]
+    set msel [$w(members) selection]
+    if {$gsel eq "" || $msel eq ""} { return }
+    set gname [$w(groups) item [lindex $gsel 0] -text]
+    set slug [lindex [split [$w(members) item [lindex $msel 0] -text] " "] 0]
+    set members {}
+    catch {set members [dict get $state(model) raw groups $gname members]}
+    set idx [lsearch -exact $members $slug]
+    if {$idx < 0} {
+        ::ui::status "$slug is not a direct member of $gname (it may arrive via an include)" orange
+        return
+    }
+    ::ui::policy_mutate [list dict set raw groups $gname members [lreplace $members $idx $idx]]
+}
+
+proc ::ui::grant_add {} {
+    variable w
+    variable state
+    set sel [$w(groups) selection]
+    if {$sel eq ""} { return }
+    set gname [$w(groups) item [lindex $sel 0] -text]
+    set cnames [lsort [dict keys [dict get $state(model) collections]]]
+    set cname [::ui::ask_choice "Add grant" "Collection to grant $gname:" $cnames]
+    if {$cname eq ""} { return }
+    set role [::ui::ask_choice "Add grant" "Role:" {read write}]
+    if {$role eq ""} { return }
+    set grants [dict get $state(model) raw grants]
+    lappend grants [dict create collection $cname group $gname roles [list $role]]
+    ::ui::policy_mutate [list dict set raw grants $grants]
+}
+
+proc ::ui::grant_remove {} {
+    variable w
+    variable state
+    set gsel [$w(groups) selection]
+    set rsel [$w(grants) selection]
+    if {$gsel eq "" || $rsel eq ""} { return }
+    set gname [$w(groups) item [lindex $gsel 0] -text]
+    set cname [$w(grants) item [lindex $rsel 0] -text]
+    set grants [dict get $state(model) raw grants]
+    set out {}
+    set dropped 0
+    foreach grant $grants {
+        if {!$dropped && [dict get $grant group] eq $gname && [dict get $grant collection] eq $cname} {
+            set dropped 1
+            continue
+        }
+        lappend out $grant
+    }
+    if {!$dropped} { return }
+    ::ui::policy_mutate [list dict set raw grants $out]
+}
+
+proc ::ui::policy_view_yaml {} {
+    variable state
+    if {![info exists state(policy_path)]} { return }
+    set top [toplevel .yamlview]
+    wm title $top [file tail $state(policy_path)]
+    pack [ttk::scrollbar $top.vs -orient vertical -command "$top.t yview"] -side right -fill y
+    set t [text $top.t -width 100 -height 40 -wrap none -yscrollcommand "$top.vs set"]
+    pack $t -fill both -expand yes
+    set f [open $state(policy_path) r]
+    fconfigure $f -encoding utf-8
+    $t insert 1.0 [read $f]
+    close $f
+    $t configure -state disabled
+}
+
+proc ::ui::build_people_tab {} {
+    variable w
+    set t [ttk::frame $w(nb_right).people]
+    set w(tab_people) $t
+    $w(nb_right) add $t -text "People"
+
+    pack [ttk::label $t.head -text "People — one row per human, one account column per platform" \
+        -font TkHeadingFont] -anchor w -padx 4 -pady {6 2}
+    pack [ttk::frame $t.top] -fill both -expand yes -padx 4
+    pack [ttk::scrollbar $t.top.vs -orient vertical -command "$t.top.list yview"] -side right -fill y
+    set w(people) [ttk::treeview $t.top.list \
+        -columns {rel od db state} -show {tree headings} -height 9 -selectmode browse \
+        -yscrollcommand "$t.top.vs set"]
+    configure_tree_columns $w(people) {
+        #0 "Person" 150 100
+        rel "Relationship" 100 70
+        od "OneDrive account" 200 130
+        db "Dropbox account" 200 130
+        state "Identity state" 180 120
+    }
+    $w(people) tag configure gap -background {#faf8ee}
+    pack $w(people) -fill both -expand yes
+    bind $w(people) <<TreeviewSelect>> ::ui::person_selected
+
+    set w(person_access_head) [ttk::label $t.ahead -text "Access everywhere" -font TkHeadingFont]
+    pack $w(person_access_head) -anchor w -padx 4 -pady {8 2}
+    pack [ttk::frame $t.acc] -fill x -padx 4
+    set w(person_access) [ttk::treeview $t.acc.list \
+        -columns {where role} -show {tree headings} -height 5]
+    configure_tree_columns $w(person_access) {
+        #0 "Collection" 200 120
+        where "Where" 170 100
+        role "Role" 60 40
+    }
+    $w(person_access) column role -anchor center
+    $w(person_access) tag configure write -background lightblue
+    $w(person_access) tag configure read -background lightyellow
+    $w(person_access) tag configure gap -background {#faf8ee}
+    pack $w(person_access) -fill x
+
+    pack [ttk::label $t.uhead -text "Unmapped identities — seen on a drive, belong to no person" \
+        -font TkHeadingFont] -anchor w -padx 4 -pady {8 2}
+    pack [ttk::frame $t.un] -fill x -padx 4
+    set w(unmapped) [ttk::treeview $t.un.list \
+        -columns {where seen suggestion} -show {tree headings} -height 5 -selectmode browse]
+    configure_tree_columns $w(unmapped) {
+        #0 "Account seen" 210 140
+        where "Where" 80 60
+        seen "First seen on" 260 150
+        suggestion "Suggestion" 200 120
+    }
+    pack $w(unmapped) -fill x
+    pack [ttk::frame $t.ubtn] -fill x -padx 4 -pady 4
+    pack [ttk::button $t.ubtn.map -text "Map to person…" -command ::ui::unmapped_map] -side left
+    pack [ttk::button $t.ubtn.new -text "Create person from this…" -command ::ui::unmapped_create] -side left -padx 3
+    pack [ttk::button $t.ubtn.out -text "Mark as outsider" -command ::ui::unmapped_outsider] -side left
+}
+
+proc ::ui::people_render {} {
+    variable w
+    variable state
+    set model $state(model)
+    foreach row [$w(people) children {}] { $w(people) delete $row }
+    dict for {slug p} [dict get $model people] {
+        set od [join [policy_person_accounts $p onedrive] ", "]
+        set db [join [policy_person_accounts $p dropbox] ", "]
+        if {$od ne "" && $db ne ""} {
+            set pstate "✓ both platforms"
+            set tags {}
+        } elseif {$od ne ""} {
+            set pstate "OneDrive only"
+            set tags gap
+        } elseif {$db ne ""} {
+            set pstate "Dropbox only"
+            set tags gap
+        } else {
+            set pstate "⚠ no accounts"
+            set tags gap
+        }
+        if {$od eq ""} { set od "— no account" }
+        if {$db eq ""} { set db "— no account" }
+        $w(people) insert {} end -text $slug -values [list \
+            [expr {[dict exists $p relationship] ? [dict get $p relationship] : ""}] \
+            $od $db $pstate] -tags $tags
+    }
+    ::ui::unmapped_render
+    ::ui::tab_counts
+}
+
+proc ::ui::person_selected {} {
+    variable w
+    variable state
+    set sel [$w(people) selection]
+    if {$sel eq ""} { return }
+    set slug [$w(people) item [lindex $sel 0] -text]
+    set model $state(model)
+    set p [dict get $model people $slug]
+    $w(person_access_head) configure -text \
+        "[identity_display $model $slug] — access everywhere"
+    foreach row [$w(person_access) children {}] { $w(person_access) delete $row }
+    set raw [dict get $model raw]
+    foreach grant [dict get $raw grants] {
+        set gname [dict get $grant group]
+        if {$slug ni [policy_v2_resolve_group [dict get $raw groups] $gname {}]} { continue }
+        set cname [dict get $grant collection]
+        set where ""
+        catch {set where [join [dict get $model collections $cname platforms] " + "]}
+        set role "read"
+        foreach r [dict get $grant roles] { if {$r eq "write"} { set role "write" } }
+        set tags $role
+        foreach platform [split $where " + "] {
+            if {$platform in [policy_known_platforms] && \
+                [llength [policy_person_accounts $p $platform]] == 0} {
+                append where " ⚠"
+                set tags gap
+                break
+            }
+        }
+        $w(person_access) insert {} end -text "$cname (via $gname)" \
+            -values [list $where $role] -tags $tags
+    }
+}
+
+proc ::ui::unmapped_render {} {
+    # Accounts the last audit saw that map to nobody
+    variable w
+    variable state
+    foreach row [$w(unmapped) children {}] { $w(unmapped) delete $row }
+    if {![info exists state(findings)]} { return }
+    set model $state(model)
+    set seen {}
+    foreach v $state(findings) {
+        set email [dict get $v email]
+        if {$email eq "" || [dict get $v person] ne ""} { continue }
+        set platform [dict get $v platform]
+        if {[identity_is_outsider $model $platform $email]} { continue }
+        set key [list $platform $email]
+        if {[dict exists $seen $key]} { continue }
+        dict set seen $key 1
+        # Suggestion: a person one of whose account local-parts matches
+        set suggestion ""
+        set local [lindex [split $email @] 0]
+        dict for {slug p} [dict get $model people] {
+            dict for {pf emails} [dict get $p accounts] {
+                foreach e $emails {
+                    if {[string equal -nocase [lindex [split $e @] 0] $local]} {
+                        set suggestion "≈ likely [identity_display $model $slug]"
+                        break
+                    }
+                }
+                if {$suggestion ne ""} { break }
+            }
+            if {$suggestion ne ""} { break }
+        }
+        $w(unmapped) insert {} end -text $email \
+            -values [list $platform [dict get $v path] $suggestion]
+    }
+}
+
+proc ::ui::unmapped_selected {} {
+    variable w
+    set sel [$w(unmapped) selection]
+    if {$sel eq ""} { return "" }
+    set row [lindex $sel 0]
+    return [list [$w(unmapped) item $row -text] \
+        [lindex [$w(unmapped) item $row -values] 0]]
+}
+
+proc ::ui::unmapped_map {} {
+    variable state
+    set pick [::ui::unmapped_selected]
+    if {$pick eq ""} { return }
+    lassign $pick email platform
+    set slugs [lsort [dict keys [dict get $state(model) people]]]
+    set slug [::ui::ask_choice "Map to person" "Whose account is $email?" $slugs]
+    if {$slug eq ""} { return }
+    set accounts {}
+    catch {set accounts [dict get $state(model) raw people $slug accounts $platform]}
+    lappend accounts $email
+    if {[::ui::policy_mutate [list dict set raw people $slug accounts $platform $accounts]]} {
+        ::ui::people_render
+    }
+}
+
+proc ::ui::unmapped_create {} {
+    set pick [::ui::unmapped_selected]
+    if {$pick eq ""} { return }
+    lassign $pick email platform
+    set name [::ui::ask_string "Create person" "Name of the person behind $email:"]
+    if {$name eq ""} { return }
+    set slug [policy_slugify $name]
+    set rel [::ui::ask_string "Create person" "Relationship (employee, contractor, …):"]
+    set rec [dict create name $name accounts [dict create $platform [list $email]]]
+    if {$rel ne ""} { dict set rec relationship $rel }
+    if {[::ui::policy_mutate [list dict set raw people $slug $rec]]} {
+        ::ui::people_render
+    }
+}
+
+proc ::ui::unmapped_outsider {} {
+    variable state
+    set pick [::ui::unmapped_selected]
+    if {$pick eq ""} { return }
+    lassign $pick email platform
+    set outsiders {}
+    catch {set outsiders [dict get $state(model) raw outsiders]}
+    lappend outsiders [dict create platform $platform email $email]
+    if {[::ui::policy_mutate [list dict set raw outsiders $outsiders]]} {
+        ::ui::people_render
+    }
 }
 
 proc ::ui::build_audit_tab {} {
@@ -1017,6 +1698,11 @@ proc ::ui::tab_counts {} {
     set label "Audit"
     if {$real > 0} { append label " ❌ $real" }
     $w(nb_right) tab $w(tab_audit) -text $label
+    set unmapped 0
+    catch {set unmapped [llength [$w(unmapped) children {}]]}
+    set label "People"
+    if {$unmapped > 0} { append label " ⚠ $unmapped" }
+    $w(nb_right) tab $w(tab_people) -text $label
 }
 
 proc ::ui::audit_cache_file {} {
@@ -2131,6 +2817,31 @@ proc on_invite_user_click {} {
     ttk::radiobutton $dialog.role_frame.write -text "Write (can edit)" -variable invite_role -value "write"
     set ::invite_role "read"
     
+    # Write into the policy too, so the next audit expects what was
+    # just shared instead of reporting it as extra access
+    set has_policy [expr {[info exists ::ui::state(model)] && $::ui::state(model) ne ""}]
+    set ::invite_to_policy 0
+    if {$has_policy} {
+        set model $::ui::state(model)
+        ttk::separator $dialog.sep
+        ttk::checkbutton $dialog.pol -text "Write this into the policy as well" \
+            -variable ::invite_to_policy
+        ttk::frame $dialog.polrow
+        ttk::label $dialog.polrow.gl -text "Group:"
+        ttk::combobox $dialog.polrow.group -state readonly -width 18 \
+            -values [lsort [dict keys [dict get $model raw groups]]]
+        ttk::label $dialog.polrow.cl -text "Collection:"
+        ttk::combobox $dialog.polrow.coll -state readonly -width 18 \
+            -values [lsort [dict keys [dict get $model collections]]]
+        # Default to the selected folder's collection when it has one
+        catch {
+            set fid $current_item_id
+            set platform $::ui::state(sel_provider)
+            $dialog.polrow.coll set [dict get $model plan $platform $fid collection]
+        }
+        set ::invite_to_policy [expr {$has_policy ? 1 : 0}]
+    }
+
     # Buttons
     ttk::frame $dialog.buttons
     ttk::button $dialog.buttons.ok -text "Invite" -command {set ::invite_dialog_result ok}
@@ -2143,6 +2854,15 @@ proc on_invite_user_click {} {
     pack $dialog.role_frame -anchor w -padx 20 -pady {0 10}
     pack $dialog.role_frame.read -anchor w
     pack $dialog.role_frame.write -anchor w
+    if {$has_policy} {
+        pack $dialog.sep -fill x -padx 10 -pady 4
+        pack $dialog.pol -anchor w -padx 10
+        pack $dialog.polrow -anchor w -padx 24 -pady {2 6}
+        pack $dialog.polrow.gl -side left
+        pack $dialog.polrow.group -side left -padx {3 8}
+        pack $dialog.polrow.cl -side left
+        pack $dialog.polrow.coll -side left -padx 3
+    }
     pack $dialog.buttons -side bottom -pady 10
     pack $dialog.buttons.ok -side left -padx 5
     pack $dialog.buttons.cancel -side left -padx 5
@@ -2156,7 +2876,15 @@ proc on_invite_user_click {} {
     if {$::invite_dialog_result eq "ok"} {
         set email [string trim [$dialog.email_entry get]]
         set role $::invite_role
-        
+        set to_policy 0
+        set pol_group ""
+        set pol_coll ""
+        if {$has_policy} {
+            set to_policy $::invite_to_policy
+            catch {set pol_group [$dialog.polrow.group get]}
+            catch {set pol_coll [$dialog.polrow.coll get]}
+        }
+
         destroy $dialog
         
         if {$email eq ""} {
@@ -2183,6 +2911,9 @@ proc on_invite_user_click {} {
         
         if {$invite_status eq "ok"} {
             ::ui::status "✅ $invite_message" green
+            if {$to_policy && $pol_group ne ""} {
+                ::ui::invite_into_policy $email $role $pol_group $pol_coll onedrive
+            }
             # Refresh ACL display
             after 1000 {refresh_current_acl}
         } elseif {$invite_status eq "error" && [string match "*401*" $invite_message]} {

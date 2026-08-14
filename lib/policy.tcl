@@ -313,8 +313,22 @@ proc policy_load_v2 {yaml_path} {
         }
     }
 
+    # Outsiders: accounts seen on a drive that belong to no person and,
+    # by the owner's decision, never will; the People view stops
+    # suggesting them.
+    set outsiders {}
+    if {[dict exists $policy outsiders]} {
+        foreach o [dict get $policy outsiders] {
+            if {[dict exists $o platform] && [dict exists $o email]} {
+                lappend outsiders [dict create platform [dict get $o platform] \
+                    email [string tolower [dict get $o email]]]
+            }
+        }
+    }
+
     return [dict create version 2 people $people identity $identity \
-        plan $plan collections $collections warnings $warnings raw $policy]
+        plan $plan collections $collections warnings $warnings \
+        outsiders $outsiders raw $policy]
 }
 
 proc identity_person_for {model platform email} {
@@ -334,12 +348,27 @@ proc identity_display {model slug} {
     return $slug
 }
 
+proc identity_is_outsider {model platform email} {
+    # Marked by the owner as belonging to no person, on purpose
+    set email [string tolower $email]
+    if {![dict exists $model outsiders]} { return 0 }
+    foreach o [dict get $model outsiders] {
+        if {[dict get $o platform] eq $platform && [dict get $o email] eq $email} {
+            return 1
+        }
+    }
+    return 0
+}
+
 proc identity_unmapped {model platform live_emails} {
-    # Emails seen on a platform that belong to no person.
+    # Emails seen on a platform that belong to no person and are not
+    # marked outsiders.
     set out {}
     foreach email $live_emails {
-        if {[identity_person_for $model $platform $email] eq ""} {
-            lappend out [string tolower $email]
+        set email [string tolower $email]
+        if {[identity_person_for $model $platform $email] eq "" && \
+            ![identity_is_outsider $model $platform $email]} {
+            lappend out $email
         }
     }
     return [lsort -unique $out]
@@ -522,4 +551,110 @@ proc policy_member_email_v1 {member} {
         return [string tolower [dict get $member email]]
     }
     return [string tolower $member]
+}
+
+# ---------------------------------------------------------------------------
+# Writing a policy back out (editors: the GUI's policy-changing buttons)
+
+proc policy_v2_emit {raw} {
+    # The version-2 YAML text for a parsed policy dict. Comments and key
+    # order of the source file do not survive a rewrite; sections come out
+    # in the canonical order with people, groups, collections sorted by key.
+    set out {}
+    lappend out "# Desired sharing state, audited and enforced with acl-manager"
+    lappend out "# (--audit / --enforce). People are named once with their per-platform"
+    lappend out "# accounts; groups reference people; grants join a group to a collection."
+    lappend out "version: 2"
+    lappend out ""
+    lappend out "people:"
+    foreach slug [lsort [dict keys [dict get $raw people]]] {
+        set p [dict get $raw people $slug]
+        lappend out "  ${slug}:"
+        foreach field {name relationship reason} {
+            if {[dict exists $p $field]} {
+                lappend out "    ${field}: [policy_yaml_quote [dict get $p $field]]"
+            }
+        }
+        if {[dict exists $p accounts]} {
+            lappend out "    accounts:"
+            dict for {platform v} [dict get $p accounts] {
+                if {[llength $v] == 1} {
+                    lappend out "      ${platform}: [policy_yaml_quote [lindex $v 0]]"
+                } else {
+                    set quoted {}
+                    foreach e $v { lappend quoted [policy_yaml_quote $e] }
+                    lappend out "      ${platform}: \[[join $quoted {, }]\]"
+                }
+            }
+        }
+    }
+    lappend out ""
+    lappend out "groups:"
+    foreach gname [lsort [dict keys [dict get $raw groups]]] {
+        set g [dict get $raw groups $gname]
+        lappend out "  ${gname}:"
+        if {[dict exists $g includes] && [llength [dict get $g includes]] > 0} {
+            set quoted {}
+            foreach inc [dict get $g includes] { lappend quoted [policy_yaml_quote $inc] }
+            lappend out "    includes: \[[join $quoted {, }]\]"
+        }
+        if {[dict exists $g members] && [llength [dict get $g members]] > 0} {
+            lappend out "    members: \[[join [dict get $g members] {, }]\]"
+        } elseif {![dict exists $g includes] || [llength [dict get $g includes]] == 0} {
+            lappend out "    members: \[\]"
+        }
+    }
+    lappend out ""
+    lappend out "collections:"
+    foreach cname [lsort [dict keys [dict get $raw collections]]] {
+        set c [dict get $raw collections $cname]
+        lappend out "  ${cname}:"
+        if {[dict exists $c closed] && [dict get $c closed]} {
+            lappend out "    closed: true"
+        }
+        if {[dict exists $c includes] && [llength [dict get $c includes]] > 0} {
+            set quoted {}
+            foreach inc [dict get $c includes] { lappend quoted [policy_yaml_quote $inc] }
+            lappend out "    includes: \[[join $quoted {, }]\]"
+        }
+        if {[dict exists $c folders]} {
+            lappend out "    folders:"
+            foreach f [dict get $c folders] {
+                lappend out "      - {platform: [dict get $f platform], path: [policy_yaml_quote [dict get $f path]], id: [policy_yaml_quote [dict get $f id]]}"
+            }
+        }
+    }
+    lappend out ""
+    lappend out "grants:"
+    foreach grant [dict get $raw grants] {
+        set roles {}
+        foreach r [dict get $grant roles] { lappend roles $r }
+        lappend out "  - {collection: [policy_yaml_quote [dict get $grant collection]], group: [policy_yaml_quote [dict get $grant group]], roles: \[[join $roles {, }]\]}"
+    }
+    if {[dict exists $raw outsiders] && [llength [dict get $raw outsiders]] > 0} {
+        lappend out ""
+        lappend out "outsiders:"
+        foreach o [dict get $raw outsiders] {
+            lappend out "  - {platform: [dict get $o platform], email: [policy_yaml_quote [dict get $o email]]}"
+        }
+    }
+    return [join $out \n]\n
+}
+
+proc policy_save {path raw} {
+    # Guarded rewrite: emit next to the file, load-validate the emission,
+    # keep a .bak of the original, then rename into place. Fails without
+    # touching the original when the emission does not load.
+    set text [policy_v2_emit $raw]
+    set tmp "$path.new"
+    set f [open $tmp w]
+    fconfigure $f -encoding utf-8
+    puts -nonewline $f $text
+    close $f
+    if {[catch {policy_load_v2 $tmp} err]} {
+        file delete $tmp
+        error "refusing to save: the rewritten policy does not load: $err"
+    }
+    catch {file copy -force $path "$path.bak"}
+    file rename -force $tmp $path
 }

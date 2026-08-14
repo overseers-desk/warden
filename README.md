@@ -1,23 +1,24 @@
-# OneDrive ACL Manager (TCL version)
+# Cloud ACL Manager
 
-OneDrive tells you who can access a folder, but only the one you're looking at, not the subfolders beneath it. Someone you shared a subfolder with years ago may still have access, and you won't know unless you open every folder by hand. OneDrive ACL Manager scans a whole folder tree at once and reports every permission at every level, so you can see who has access to what.
+A drive tells you who can access a folder, but only the one you're looking at, not the subfolders beneath it. Someone you shared a subfolder with years ago may still have access, and you won't know unless you open every folder by hand. Cloud ACL Manager audits OneDrive and Dropbox against one policy file that names your people once, whatever address each drive knows them by, and it can fix what drifted.
 
 ## What it does
 
+- Audit both drives against one policy (people, groups, folder collections, grants) and enforce it, with a dry-run preview
 - Recursive ACL scan of a folder tree, with smart pruning of inherited permissions
 - Find everything a given user can access across a tree
 - Remove a user's access across a tree, with a dry-run preview
-- Invite a user to a folder, inherited by its children
+- Invite a user to a folder, inherited by its children (optionally written into the policy in the same act)
 - Scan folders, files, or both
-- Reads tokens from both rclone's config and its own `token.json`, for read-only or full-permission work
+- Reads tokens from rclone's config (both remotes) and its own `token.json` for elevated OneDrive work
 
-Two interfaces: a Tcl/Tk GUI for browsing folders and viewing permissions (a subset of the commands), and a command line with the full set, including the recursive operations.
+Two interfaces: a Tcl/Tk browser with Access, Policy, People, and Audit tabs over both drives, and a command line with the full set of operations, including the recursive scans and scheduled audits.
 
 ## Install
 
 ### Windows (tested on Windows 11)
 
-1. Put `acl-manager.tcl` where you like (e.g. your home directory).
+1. Copy the repository directory where you like (`acl-manager.tcl` loads the `lib/` beside it).
 2. Provide `rclone.conf` at `%APPDATA%\rclone\rclone.conf`. A working config is required (untested without one). You don't need rclone itself installed; copying a working `rclone.conf` from another machine is enough.
 3. Install Magicsplat Tcl/Tk 9.0 (other versions untested); it lands at `%APPDATA%\Local\Apps\Tcl90`.
 4. Run it:
@@ -28,10 +29,12 @@ Two interfaces: a Tcl/Tk GUI for browsing folders and viewing permissions (a sub
 ### Linux and macOS
 
 ```bash
-rclone config                              # set up your OneDrive remote
+rclone config                              # set up your OneDrive and Dropbox remotes
 sudo apt-get install tcl9.0 tk9.0 tcllib tcl-tls   # Ubuntu/Debian; tk9.0 is for the browser
 brew install tcl-tk                                # macOS
 ```
+
+The browser shows one folder tree root per configured remote. A machine with only the OneDrive remote simply has no Dropbox root.
 
 ## Usage
 
@@ -41,7 +44,9 @@ GUI:
 wish9.0 acl-manager.tcl "Finance"          # ...starting at a folder
 ```
 
-Run with no arguments and it opens the browser at the drive root, loading Tk into the interpreter it is already running in. Any argument sends it to the command line instead, so starting the browser at a particular folder means running it under `wish9.0` and naming the folder. Tcl and Tk 9 are required: names on the drive carry characters an older Tcl cannot hold in a string, so the script stops on one rather than show you a name that is not the name.
+Run with no arguments and it opens the browser, loading Tk into the interpreter it is already running in. Any argument sends it to the command line instead, so starting the browser at a particular folder means running it under `wish9.0` and naming the folder. Tcl and Tk 9 are required: names on the drive carry characters an older Tcl cannot hold in a string, so the script stops on one rather than show you a name that is not the name.
+
+In the browser, the left pane holds the folder trees (with a per-folder policy badge) and a Groups view of the policy; the right pane holds four tabs. Access shows a folder's ACL with the policy's intent beside the drive's actuality. Policy edits groups, members, collections, and grants (edits rewrite the YAML file, keeping a `.bak`). People shows one row per human with their account on each platform, plus unmapped identities seen on a drive with actions to map, create, or mark them outsiders. Audit runs the same audit as the command line, lets you tick which fixes to apply, previews them as a dry-run change list, and applies only what you ticked.
 
 Command line:
 ```bash
@@ -57,7 +62,9 @@ Command line:
 - `--remove-user USER` - remove USER's access from what's found; destructive, needs `-r` or an explicit depth
 - `--invite USER` - invite USER with read/write, inherited by children; not usable with `-r`
 - `--audit POLICY` - compare live ACLs against a policy file (read-only; see below)
-- `--enforce POLICY` - audit, then fix the drive to match the policy
+- `--enforce POLICY` - audit, then fix the drives to match the policy
+- `--platform onedrive|dropbox` - restrict `--audit`/`--enforce` to one platform
+- `--convert-policy POLICY` - print the version-2 (person-based) form of an email-per-member policy file
 - `--dry-run` - preview a `--remove-user` or `--enforce` without changing anything
 - `--read-only` - invite with read-only instead of read/write
 - `--debug` - debug output
@@ -106,19 +113,43 @@ wish9.0 acl-manager.tcl "Finance"
 
 ## Policy files
 
-People forget permissions: they share a folder mid-task, staff leave, folders move, and nobody notices until data has leaked. A policy file turns the intended sharing state into data the tool can check and restore. It is YAML with three sections: `groups` name people once (each member records email, name, contractual relationship, and why they have access), `collections` name folder sets by path plus stable item id (the id survives renames and moves, which is how drift is caught), and `grants` join a group to a collection with a role (`read` or `write`).
+People forget permissions: they share a folder mid-task, staff leave, folders move, and nobody notices until data has leaked. A policy file turns the intended sharing state into data the tool can check and restore. It is YAML (version 2) with four sections. `people` name each human once, with their contractual relationship, why they hold access, and their account address on each platform (a person can hold several addresses on one platform, and can lack a platform entirely). `groups` collect people by their keys. `collections` name folder sets, each folder carrying its platform, its path (the human label), and its stable id (the id survives renames and moves, which is how drift is caught). `grants` join a group to a collection with a role (`read` or `write`). An optional `outsiders` section lists accounts that belong to no person on purpose, which quiets the People view's suggestions about them.
 
-Folder paths run from the drive root, so one policy file covers every top-level folder on a drive. A drive holding several companies' folders is governed by one file, and a folder outside every collection is simply not audited.
+```yaml
+version: 2
+people:
+  alice:
+    name: Alice Example
+    relationship: accountant
+    reason: quarterly filings
+    accounts:
+      onedrive: alice@corp.example
+      dropbox: [alice.p@gmail.example, alice@old.example]
+groups:
+  finance: {members: [alice]}
+collections:
+  tax:
+    closed: true
+    folders:
+      - {platform: onedrive, path: "Finance/Tax", id: "ABC!456"}
+      - {platform: dropbox,  path: "/Tax",        id: "id:AAA"}
+grants:
+  - {collection: tax, group: finance, roles: [write]}
+```
 
-To get the item ids for a new collection, list the folder with rclone:
+A policy written in the older email-per-member form converts once with `--convert-policy old.yaml > new.yaml`; members sharing a display name merge into one person holding each address.
+
+Folder paths run from the drive root, so one policy file covers every top-level folder on a drive. A drive holding several companies' folders is governed by one file, and a folder outside every collection is simply not audited. A grant reaching a person with no account on that platform is reported as an unreachable warning, not a violation: the policy records the intent the platform cannot yet carry.
+
+To get the item ids for a new collection, right-click a folder in the browser ("Copy item id"), or list the folder with rclone:
 
 ```bash
 rclone lsjson "OneDrive:Some Folder" --dirs-only | jq -r '.[] | [.ID, .Name] | @tsv'
 ```
 
-rclone prints the id as `<drive>#<item>`; the policy file takes the part after the `#`.
+rclone prints a OneDrive id as `<drive>#<item>` and the policy file takes the part after the `#`; a Dropbox id is used whole (the `id:...` form).
 
-A grant reaches descendants through OneDrive inheritance, so a folder's entitlements are its own grants plus its policy ancestors'. A collection marked `closed: true` is the exception: its folders admit exactly their own grants, and anything beyond, direct or inherited, is a violation. `--audit` reports violations folder by folder (`--format csv` for machines) and exits nonzero on any; `--enforce` invites missing users quietly (no notification email), downgrades or removes wrong ones, and handles inherited permissions with the move-to-root cycle described in `docs/PHANTOM-INHERITANCE-BUG.md`, re-checking descendants of changed folders for leaked copies afterwards.
+A grant reaches descendants through the platform's inheritance, so a folder's entitlements are its own grants plus its policy ancestors' on the same platform. A collection marked `closed: true` is the exception: its folders admit exactly their own grants, and anything beyond, direct or inherited, is a violation, as is a shared link on a closed Dropbox folder. `--audit` reports violations folder by folder (`--format csv` for machines) and exits nonzero on any; on Dropbox it also lists records of deleted shares, which persist and can keep live public links (`docs/DROPBOX.md`). `--enforce` invites missing users quietly (no notification email), downgrades or removes wrong ones, and severs inherited excess where the platform allows it: on OneDrive with the move-to-root cycle described in `docs/PHANTOM-INHERITANCE-BUG.md` (re-checking descendants of changed folders for leaked copies afterwards); on Dropbox, where a folder inside a shared folder cannot be detached in place, by naming the ancestor share so the owner decides between removing the member there and relocating the folder.
 
 ## Scheduled audits
 
@@ -136,7 +167,9 @@ Changes to this procedure land in this section, so re-read it when the audit sta
 
 Reading (scanning, listing ACLs) needs the `Files.Read` scope; writing (invite, remove) needs `Files.ReadWrite` plus `Sites.Manage.All`.
 
-Tokens come from two places: `rclone.conf` (usually read-only, `Files.Read`) and `token.json` in the application directory (full permissions, created automatically when needed). The app prefers `token.json` and falls back to `rclone.conf` for read-only work. When a write needs more than `rclone.conf` grants, it opens a web sign-in to create or update `token.json`. Expired tokens are refreshed automatically when possible.
+OneDrive tokens come from two places: `rclone.conf` (usually read-only, `Files.Read`) and `token.json` in the application directory (full permissions, created automatically when needed). The app prefers `token.json` and falls back to `rclone.conf` for read-only work. When a write needs more than `rclone.conf` grants, it opens a web sign-in to create or update `token.json`. Expired tokens are refreshed automatically when possible.
+
+The Dropbox token is rclone's for the Dropbox remote, used for reading and writing alike; when it has expired, the app has rclone refresh it in place.
 
 Safety: destructive operations prompt for confirmation (not bypassable) and owner permissions can't be removed. Always `--dry-run` a removal first.
 
@@ -151,6 +184,8 @@ Safety: destructive operations prompt for confirmation (not bypassable) and owne
 **Access denied.** Check the path, that you're allowed to view the ACL, and that your rclone token has enough scope.
 
 ## API
+
+Dropbox: the `/2/files` and `/2/sharing` HTTP endpoints; the behavioural rules the sharing API actually follows are recorded in `docs/DROPBOX.md`.
 
 Microsoft Graph:
 - `GET /me/drive/root:/{item-path}` (item info)
