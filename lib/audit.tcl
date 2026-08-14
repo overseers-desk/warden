@@ -388,6 +388,7 @@ proc enforce_folder {provider ctx fid fentry dry_run} {
         }
     }
 
+    set unenforceable {}
     if {!$moved} {
         dict for {email role} $to_add {
             lassign [{*}[dict get $provider invite] $ctx $fid $email $role] istatus imsg
@@ -395,6 +396,9 @@ proc enforce_folder {provider ctx fid fentry dry_run} {
                 puts "  ➕ invited $email ($role)"
             } elseif {$istatus eq "ok-notified"} {
                 puts "  ➕ invited $email ($role); ⚠️ notification email was sent"
+            } elseif {$istatus eq "unenforceable"} {
+                puts "  ⛔ $email: $imsg"
+                dict set unenforceable $email 1
             } else {
                 puts "  ❌ invite $email failed: $imsg"
             }
@@ -403,22 +407,34 @@ proc enforce_folder {provider ctx fid fentry dry_run} {
             lassign [{*}[dict get $provider invite] $ctx $fid $email $role] istatus imsg
             if {$istatus in {ok ok-notified}} {
                 puts "  🔁 re-invited $email as $role"
+            } elseif {$istatus eq "unenforceable"} {
+                puts "  ⛔ $email: $imsg"
+                dict set unenforceable $email 1
             } else {
                 puts "  ❌ re-invite $email failed: $imsg"
             }
         }
     }
 
-    # Verify, allowing one settle-and-retry for propagation
+    # Verify, allowing one settle-and-retry for propagation. A violation
+    # whose fix the platform's plan refused is residue of a known kind:
+    # reported, never blocking the exit.
     foreach wait {0 3000} {
         if {$wait > 0} { after $wait }
         lassign [audit_folder $provider $ctx $fid $fentry] vleft _ _
         set remaining {}
         foreach v $vleft {
-            if {![violation_is_informational $v]} { lappend remaining $v }
+            if {[violation_is_informational $v]} { continue }
+            if {[dict exists $unenforceable [dict get $v email]] && \
+                [dict get $v type] in {missing_user wrong_role}} { continue }
+            lappend remaining $v
         }
         if {[llength $remaining] == 0} {
-            puts "  ✅ verified"
+            if {[dict size $unenforceable] > 0} {
+                puts "  ✅ verified ([dict size $unenforceable] grant(s) unenforceable on the current plan, listed above)"
+            } else {
+                puts "  ✅ verified"
+            }
             return [list ok 1 {}]
         }
     }

@@ -461,9 +461,12 @@ proc dbx_list_folder_members {token sfid} {
 # ============================================================================
 # Provider interface
 # ============================================================================
-# Read-only for now: audit reaches Dropbox through these procs; the
-# mutation verbs (invite, remove, sever) are not yet implemented, and
-# their absence from the dict is what tells the enforcement code so.
+# The audit reads through get_item/get_acl/sweep; enforcement writes
+# through invite and remove. sever refuses with the reasons: on Dropbox
+# a folder inside a shared folder cannot be detached in place (moving it
+# out severs only while it stays out, and set_access_inheritance is
+# team-gated), so inherited excess is fixed at the ancestor share or by
+# relocating the folder, both decisions the owner makes.
 
 namespace eval ::dbx {
     variable meta_cache {}   ;# sfid -> get_folder_metadata dict, per connect
@@ -477,6 +480,9 @@ proc dropbox_provider {} {
         item_path dbx_item_path \
         get_acl dbx_get_acl \
         sweep dbx_sweep \
+        invite dbx_invite \
+        remove dbx_remove \
+        sever dbx_sever \
         capabilities [dict create roles {read write} sever 0]]
 }
 
@@ -484,9 +490,6 @@ proc dbx_connect {remote mode} {
     # Returns a ctx dict, or "" when no usable token exists. The rclone
     # token expires hourly; a cheap probe catches that and one rclone call
     # makes rclone refresh it in place.
-    if {$mode eq "write"} {
-        return ""
-    }
     if {[catch {read_dropbox_token $remote} token]} {
         puts "❌ $token"
         return ""
@@ -656,4 +659,201 @@ proc dbx_sweep {ctx} {
             detail "share record survives deletion; any links on it are still live"]
     }
     return $violations
+}
+
+proc dbx_wait_remove_job {token job_id} {
+    # remove_folder_member has its own poll endpoint; failure nests the
+    # same two levels as the sharing jobs (docs/DROPBOX.md).
+    set body [::json::write::object \
+        async_job_id [::json::write::string $job_id]]
+    while {1} {
+        set st [dbx_call $token /2/sharing/check_remove_member_job_status $body]
+        set tag [dict get $st .tag]
+        if {$tag eq "in_progress"} { after 2000; continue }
+        if {$tag eq "complete"} return
+        if {$tag eq "failed"} {
+            set reason "unknown"
+            if {[dict exists $st failed]} {
+                set f [dict get $st failed]
+                if {[dict exists $f .tag]} {
+                    set outer [dict get $f .tag]
+                    set reason $outer
+                    if {[dict exists $f $outer .tag]} {
+                        set reason "$outer/[dict get $f $outer .tag]"
+                    }
+                }
+            }
+            error "job failed: $reason"
+        }
+        error "unexpected check_remove_member_job_status response: $st"
+    }
+}
+
+proc dbx_share_folder {token path} {
+    # Share a folder and return its sfid, polling the async launch.
+    set resp [dbx_call $token /2/sharing/share_folder \
+        [::json::write::object path [::json::write::string $path]]]
+    set tag [dict get $resp .tag]
+    if {$tag eq "async_job_id"} {
+        set body [::json::write::object \
+            async_job_id [::json::write::string [dict get $resp async_job_id]]]
+        while {1} {
+            set st [dbx_call $token /2/sharing/check_share_job_status $body]
+            set stag [dict get $st .tag]
+            if {$stag eq "in_progress"} { after 2000; continue }
+            if {$stag eq "complete"} { set resp $st; break }
+            error "share_folder failed: $st"
+        }
+    }
+    if {[dict exists $resp shared_folder_id]} {
+        return [dict get $resp shared_folder_id]
+    }
+    if {[dict exists $resp complete shared_folder_id]} {
+        return [dict get $resp complete shared_folder_id]
+    }
+    error "share_folder returned no shared_folder_id: $resp"
+}
+
+proc dbx_role_access_level {role} {
+    switch -- $role {
+        write { return editor }
+        read { return viewer }
+    }
+    error "unknown role '$role'"
+}
+
+proc dbx_invite {ctx fid email role} {
+    # {status msg}: ok | failed | unenforceable. Shares the folder first
+    # when it is not shared; a folder inside a shared folder cannot be
+    # shared on its own (inside_shared_folder), so a grant binding there
+    # is satisfiable only at the enclosing share.
+    set token [dict get $ctx token]
+    lassign [dbx_get_item $ctx $fid] status m
+    if {$status ne "ok"} { return [list failed "cannot resolve folder"] }
+
+    set own_sfid ""
+    if {[dict exists $m sharing_info shared_folder_id]} {
+        set own_sfid [dict get $m sharing_info shared_folder_id]
+    }
+    if {$own_sfid eq ""} {
+        if {[dict exists $m sharing_info parent_shared_folder_id]} {
+            set anc [dict get $m sharing_info parent_shared_folder_id]
+            set apath "(sfid $anc)"
+            catch {set apath [dict get [dbx_folder_meta $token $anc] path_display]}
+            return [list failed "inside the shared folder $apath; Dropbox only grants at a share root, so this grant is satisfiable only there"]
+        }
+        if {[catch {dbx_share_folder $token [dict get $m path_display]} own_sfid]} {
+            return [list failed "share_folder: $own_sfid"]
+        }
+    }
+
+    set body [::json::write::object \
+        shared_folder_id [::json::write::string $own_sfid] \
+        members [::json::write::array [::json::write::object \
+            member [::json::write::object \
+                .tag [::json::write::string email] \
+                email [::json::write::string $email]] \
+            access_level [::json::write::object \
+                .tag [::json::write::string [dbx_role_access_level $role]]]]] \
+        quiet true]
+    if {[catch {dbx_call $token /2/sharing/add_folder_member $body} err]} {
+        if {[string match "*insufficient_plan*" $err]} {
+            # TODO(plan-upgrade): on a plan where this stops failing,
+            # nothing else changes; the invite below already sends the
+            # viewer access level.
+            return [list unenforceable "the current Dropbox plan refuses this membership: $err"]
+        }
+        return [list failed $err]
+    }
+    return [list ok ""]
+}
+
+proc dbx_remove {ctx fid emails} {
+    # {removed blocked}: a member or invitee of this folder's own share is
+    # removable here; access reaching this folder from an ancestor share
+    # is not, and lands in blocked for the sever path to explain.
+    set token [dict get $ctx token]
+    lassign [dbx_get_item $ctx $fid] status m
+    if {$status ne "ok"} { return [list {} $emails] }
+    set own_sfid ""
+    if {[dict exists $m sharing_info shared_folder_id]} {
+        set own_sfid [dict get $m sharing_info shared_folder_id]
+    }
+    if {$own_sfid eq ""} {
+        return [list {} $emails]
+    }
+
+    set own {}
+    foreach r [dbx_list_folder_members $token $own_sfid] {
+        lassign [dbx_member_email_role $r] remail rrole rinh
+        if {$remail eq "" || $rinh} { continue }
+        dict set own $remail 1
+    }
+
+    set removed {}
+    set blocked {}
+    foreach email $emails {
+        if {![dict exists $own $email]} {
+            lappend blocked $email
+            continue
+        }
+        set body [::json::write::object \
+            shared_folder_id [::json::write::string $own_sfid] \
+            member [::json::write::object \
+                .tag [::json::write::string email] \
+                email [::json::write::string $email]] \
+            leave_a_copy false]
+        if {[catch {dbx_call $token /2/sharing/remove_folder_member $body} resp]} {
+            lappend blocked $email
+            continue
+        }
+        if {[dict exists $resp .tag] && [dict get $resp .tag] eq "async_job_id"} {
+            if {[catch {dbx_wait_remove_job $token [dict get $resp async_job_id]} jerr]} {
+                puts "  ❌ remove $email: $jerr"
+                lappend blocked $email
+                continue
+            }
+        }
+        lappend removed $email
+    }
+
+    # Believe success only after a re-read, in the spirit of the OneDrive
+    # phantom-permission lesson.
+    if {[llength $removed] > 0} {
+        after 1000
+        set still {}
+        foreach r [dbx_list_folder_members $token $own_sfid] {
+            lassign [dbx_member_email_role $r] remail rrole rinh
+            if {$remail ne "" && !$rinh} { dict set still $remail 1 }
+        }
+        set truly {}
+        foreach email $removed {
+            if {[dict exists $still $email]} {
+                lappend blocked $email
+            } else {
+                lappend truly $email
+            }
+        }
+        set removed $truly
+    }
+    return [list $removed $blocked]
+}
+
+proc dbx_sever {ctx fid fentry item_dict blocked} {
+    # Inherited excess at a folder inside a shared folder has no in-place
+    # fix on this plan: relocating the folder severs only while it stays
+    # relocated, and dropping the member at the ancestor share strips
+    # their access to every sibling. Both change more than this folder,
+    # so the choice belongs to the owner; name the ancestor and stop.
+    set token [dict get $ctx token]
+    set anc ""
+    if {[dict exists $item_dict sharing_info parent_shared_folder_id]} {
+        set anc [dict get $item_dict sharing_info parent_shared_folder_id]
+    }
+    set where "an ancestor share"
+    if {$anc ne ""} {
+        catch {set where [dict get [dbx_folder_meta $token $anc] path_display]}
+    }
+    puts "  ⛔ [join $blocked {, }]: access is inherited from $where; fix it there (remove the member, or relocate this folder out of the share for good)"
+    return [list error 0]
 }
