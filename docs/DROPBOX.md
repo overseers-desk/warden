@@ -113,9 +113,13 @@ Each member record in `/2/sharing/list_folder_members` carries `is_inherited`; a
 
 `/2/files/get_metadata` accepts the `id:` form in its `path` argument and resolves it for shared roots, nested shares, and plain unshared folders alike. For folders, `sharing_info` in the same response carries `shared_folder_id` and, when nested, `parent_shared_folder_id`, so the sharing-graph ancestor chain is reachable from file metadata. The `id:` form is the stable folder reference; a shared-folder id (sfid) appears and disappears with share state.
 
-## Viewer members exist on Basic shares
+## Viewer members work on this Basic account
 
-A Basic account's share can hold a member with `access_type: viewer` (observed live). The `insufficient_plan` gate documented for `add_folder_member`/`update_folder_member` restricts creating or downgrading to viewer through the API on an unpaid plan; it does not mean viewer records cannot exist (the web UI, another member's plan, or an earlier plan may have created them). Read code must handle viewer; write code discovers its own limits from the API error, not from an assumption that viewers are impossible.
+`add_folder_member` with `access_level: viewer` and an email selector returns HTTP 200 on this Basic account, and the invitee appears with `access_type: viewer` (observed live on a sacrificial folder, 2026-08-14). The API spec's doc string ("adding a read-only member ... can only be performed by users that have upgraded to a Pro or Business plan", `insufficient_plan`) did not fire. Live shares on the account also hold accepted viewer members. So read-only grants are addable here; treat `insufficient_plan` as a runtime error to surface if it ever appears (perhaps for existing-user selectors or for `update_folder_member` downgrades, both untested), not as a precondition to code around.
+
+## Unshare can change the folder's file id
+
+A folder created as `id:...rKg`, shared, then unshared (`leave_a_copy false`) was deleted moments later under `id:...rOQ`: the id: changed across the share-state transition. The id survives renames and moves, so it is still the right policy reference for folders whose share state the tool does not flip; any unshare/reshare cycle (the sever path) re-resolves the folder by path afterwards and reports when the id no longer matches the policy.
 
 # Story: 2026-05-09, /2023-05 Signed unshare blocked by no-path child sfid 4087858721
 

@@ -33,7 +33,7 @@ package require yaml
 # The library files carry everything below the entry points; source them
 # next to this script so a directory copy is a complete install.
 set libdir [file join [file dirname [file normalize [info script]]] lib]
-foreach libfile {http.tcl auth-onedrive.tcl provider-onedrive.tcl policy.tcl audit.tcl} {
+foreach libfile {http.tcl auth-onedrive.tcl provider-onedrive.tcl provider-dropbox.tcl policy.tcl audit.tcl} {
     source [file join $libdir $libfile]
 }
 unset libfile
@@ -2342,6 +2342,7 @@ proc main {argc argv} {
         {audit.arg "" "Audit live ACLs against a POLICY yaml file (read-only)"}
         {enforce.arg "" "Audit then fix live ACLs to match a POLICY yaml file"}
         {convert-policy.arg "" "Print the version-2 form of an email-per-member POLICY yaml file"}
+        {platform.arg "" "Restrict --audit/--enforce to one platform (onedrive|dropbox)"}
         {r "Include children in scan (recursive, default depth: 3)"}
         {recursive "Include children in scan (recursive, default depth: 3)"}
         {max-depth.arg "0" "Max depth (default: 3 with -r, 0 otherwise)"}
@@ -2476,6 +2477,18 @@ proc main {argc argv} {
         exit 1
     }
 
+    # Validate --platform: policy modes only, known platform names
+    if {$params(platform) ne ""} {
+        if {$audit_policy eq "" && $enforce_policy eq ""} {
+            puts "Error: --platform can only be used with --audit or --enforce"
+            exit 1
+        }
+        if {$params(platform) ni [policy_known_platforms]} {
+            puts "Error: --platform must be one of: [join [policy_known_platforms] {, }]"
+            exit 1
+        }
+    }
+
     # Validate --format csv only with default ACL display mode or --audit
     if {$output_format eq "csv" && ($only_user ne "" || $remove_user ne "" || $invite_user ne "" || $enforce_policy ne "")} {
         puts "Error: --format csv can only be used with default ACL display mode or --audit"
@@ -2496,10 +2509,10 @@ proc main {argc argv} {
     
     # Execute based on flags
     if {$audit_policy ne ""} {
-        exit [audit_cli $audit_policy $output_format $remote_name]
+        exit [audit_cli $audit_policy $output_format $remote_name $params(platform)]
 
     } elseif {$enforce_policy ne ""} {
-        exit [enforce_cli $enforce_policy $dry_run $auto_yes $remote_name]
+        exit [enforce_cli $enforce_policy $dry_run $auto_yes $remote_name $params(platform)]
 
     } elseif {$invite_user ne ""} {
         # Invite user to path

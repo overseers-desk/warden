@@ -23,6 +23,7 @@ package require yaml
 proc provider_for {platform} {
     switch -- $platform {
         onedrive { return [onedrive_provider] }
+        dropbox { return [dropbox_provider] }
         default { error "no provider for platform '$platform'" }
     }
 }
@@ -32,6 +33,7 @@ proc platform_remote {platform remote_name} {
     # own rclone section.
     switch -- $platform {
         onedrive { return $remote_name }
+        dropbox { return "Dropbox" }
         default { error "no rclone remote mapping for platform '$platform'" }
     }
 }
@@ -123,6 +125,23 @@ proc audit_folder {provider ctx fid fentry} {
         }
     }
 
+    # Shared links grant access to anyone holding the URL; a link on a
+    # closed folder is a violation, on an open one a note. OneDrive links
+    # arrive as permission entries and are judged above; this pass serves
+    # providers whose links live outside the member list.
+    if {[dict exists $acl links]} {
+        foreach link [dict get $acl links] {
+            set url [dict get $link url]
+            if {$closed} {
+                lappend violations [dict create type shared_link path $rel_path id $fid \
+                    email "" expected "" actual "" detail "$url on a closed collection"]
+            } else {
+                lappend violations [dict create type open_link path $rel_path id $fid \
+                    email "" expected "" actual "" detail "$url; open collection, tolerated"]
+            }
+        }
+    }
+
     return [list $violations $live_all $item_dict]
 }
 
@@ -143,9 +162,10 @@ proc plan_ids_parents_first {plan} {
 }
 
 proc violation_is_informational {v} {
-    # Tolerated-by-policy excess on open collections and the moved
-    # advisory (id is authoritative) do not fail an audit
-    return [expr {[dict get $v type] in {open_extra open_inherited moved}}]
+    # Tolerated-by-policy excess on open collections, the moved advisory
+    # (id is authoritative), links on open collections, and account-wide
+    # sweep findings do not fail an audit
+    return [expr {[dict get $v type] in {open_extra open_inherited moved open_link phantom_share}}]
 }
 
 proc violation_display_name {model v} {
@@ -222,6 +242,18 @@ proc audit_print_report {violations model format {multi 0}} {
                     puts "   ⚠️  MOVED: [dict get $v detail]"
                     incr info
                 }
+                shared_link {
+                    puts "   ❌ LINK [dict get $v detail]"
+                    incr real
+                }
+                open_link {
+                    puts "   ℹ️  link [dict get $v detail]"
+                    incr info
+                }
+                phantom_share {
+                    puts "   ℹ️  [dict get $v detail]"
+                    incr info
+                }
                 not_found -
                 error {
                     puts "   ❌ [string toupper [dict get $v type]]: [dict get $v detail]"
@@ -255,7 +287,7 @@ proc stamp_platform_person {model platform violations} {
     return $out
 }
 
-proc audit_cli {policy_path format remote_name} {
+proc audit_cli {policy_path format remote_name {platform_filter ""}} {
     # Returns the process exit code: 0 clean, 1 violations, 2 policy error
     global quiet_mode
     set quiet_mode [expr {$format eq "csv"}]
@@ -264,7 +296,7 @@ proc audit_cli {policy_path format remote_name} {
         puts "❌ Policy error: $model"
         return 2
     }
-    set plans [dict get $model plan]
+    set plans [plans_filtered $model $platform_filter]
     set total 0
     dict for {platform subplan} $plans { incr total [dict size $subplan] }
 
@@ -289,6 +321,10 @@ proc audit_cli {policy_path format remote_name} {
         foreach fid [plan_ids_parents_first $subplan] {
             lassign [audit_folder $provider $ctx $fid [dict get $subplan $fid]] v _ _
             lappend violations {*}[stamp_platform_person $model $platform $v]
+        }
+        if {[dict exists $provider sweep]} {
+            lappend violations {*}[stamp_platform_person $model $platform \
+                [{*}[dict get $provider sweep] $ctx]]
         }
     }
 
@@ -390,13 +426,26 @@ proc enforce_folder {provider ctx fid fentry dry_run} {
     return [list warning 1 $remaining]
 }
 
-proc enforce_cli {policy_path dry_run auto_yes remote_name} {
+proc plans_filtered {model platform_filter} {
+    # The per-platform plans, cut to one platform when a filter names it
+    set plans [dict get $model plan]
+    if {$platform_filter eq ""} { return $plans }
+    if {![dict exists $plans $platform_filter]} {
+        error "the policy has no $platform_filter folders"
+    }
+    return [dict create $platform_filter [dict get $plans $platform_filter]]
+}
+
+proc enforce_cli {policy_path dry_run auto_yes remote_name {platform_filter ""}} {
     # Returns the process exit code: 0 clean, 1 residue, 2 policy error
     if {[catch {policy_load_v2 $policy_path} model]} {
         puts "❌ Policy error: $model"
         return 2
     }
-    set plans [dict get $model plan]
+    if {[catch {plans_filtered $model $platform_filter} plans]} {
+        puts "❌ $plans"
+        return 2
+    }
     set total 0
     dict for {platform subplan} $plans { incr total [dict size $subplan] }
     set multi [expr {[dict size $plans] > 1}]
@@ -408,6 +457,10 @@ proc enforce_cli {policy_path dry_run auto_yes remote_name} {
     dict for {platform subplan} $plans {
         if {[catch {provider_for $platform} provider]} {
             puts "❌ $provider"
+            return 2
+        }
+        if {![dict exists $provider invite]} {
+            puts "❌ the $platform provider audits only; enforcement for it is not built yet (--platform can exclude it)"
             return 2
         }
         set ctx [{*}[dict get $provider connect] [platform_remote $platform $remote_name] write]
