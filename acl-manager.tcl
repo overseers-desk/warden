@@ -244,6 +244,8 @@ proc ::ui::policy_open {{path ""}} {
         close $pf
     }
     $w(policy_label) configure -text $path -foreground black
+    catch {::ui::audit_restore}
+    catch {::ui::badges_refresh}
     set nwarn [llength [dict get $model warnings]]
     set summary "Policy: [file tail $path] loaded"
     if {$nwarn > 0} { append summary " ($nwarn unreachable grant(s))" }
@@ -321,17 +323,16 @@ proc ::ui::build_browser {} {
     pack [ttk::scrollbar $left_frame.vscroll -orient vertical -command "$left_frame.tree yview"] -side right -fill y
 
     set w(tree) [ttk::treeview $left_frame.tree \
-        -columns {item_id type loaded provider} -show tree \
+        -columns {item_id type loaded provider badge} -show {tree headings} \
+        -displaycolumns {badge} \
         -selectmode browse \
         -yscrollcommand "$left_frame.vscroll set" \
         -xscrollcommand "$left_frame.hscroll set"]
     pack $w(tree) -side left -fill both -expand yes
 
-    # Hide metadata columns (used internally)
-    $w(tree) column item_id -width 0 -stretch 0
-    $w(tree) column type -width 0 -stretch 0
-    $w(tree) column loaded -width 0 -stretch 0
-    $w(tree) column provider -width 0 -stretch 0
+    $w(tree) heading #0 -text "Folder"
+    $w(tree) heading badge -text "Policy"
+    $w(tree) column badge -width 60 -stretch 0 -anchor center
 
     # Bind events for selection and expansion
     bind $w(tree) <<TreeviewSelect>> {on_tree_select $::ui::w(tree)}
@@ -364,7 +365,7 @@ proc ::ui::build_browser {} {
     foreach conn $state(connections) {
         set root_id [expr {[dict get $conn platform] eq "onedrive" ? "root" : ""}]
         set root_item [$w(tree) insert {} end -text [dict get $conn label] \
-            -values [list $root_id "folder" 0 [dict get $conn platform]]]
+            -values [list $root_id "folder" 0 [dict get $conn platform] ""]]
         $w(tree) insert $root_item end -text ""
     }
 }
@@ -372,9 +373,19 @@ proc ::ui::build_browser {} {
 proc ::ui::build_acl_pane {} {
     variable w
 
-    # RIGHT PANE: ACL Display
-    set right_frame [ttk::frame $w(paned).acl]
-    $w(paned) add $right_frame -weight 2
+    # RIGHT PANE: a notebook of Access / Policy / People / Audit
+    set w(nb_right) [ttk::notebook $w(paned).nb]
+    $w(paned) add $w(nb_right) -weight 2
+    set right_frame [ttk::frame $w(nb_right).access]
+    set w(tab_access) $right_frame
+    $w(nb_right) add $right_frame -text "Access"
+    foreach {name title} {policy Policy people People} {
+        set w(tab_$name) [ttk::frame $w(nb_right).$name]
+        $w(nb_right) add $w(tab_$name) -text $title
+        pack [ttk::label $w(tab_$name).todo -text "(built in a later step this wave)" \
+            -foreground gray50] -expand yes
+    }
+    ::ui::build_audit_tab
 
     # Set initial sash position after window is mapped (gives 35% to left, 65% to right)
     bind $w(paned) <Map> {
@@ -402,6 +413,10 @@ proc ::ui::build_acl_pane {} {
     pack $w(item_entry) -side left -fill x -expand yes -padx {5 0}
     $w(item_entry) configure -state readonly
 
+    # What the policy says about this folder
+    set w(governed) [ttk::label $right_frame.governed -text "" -wraplength 640 -justify left]
+    pack $w(governed) -fill x -anchor w -pady {0 5}
+
     # Create treeview frame for ACL display
     pack [ttk::frame $right_frame.tree] -fill both -expand yes
 
@@ -410,20 +425,20 @@ proc ::ui::build_acl_pane {} {
     pack [ttk::scrollbar $right_frame.tree.vscroll -orient vertical -command "$right_frame.tree.list yview"] -side right -fill y
 
     # Treeview widget (with multi-select enabled)
-    set w(acl) [ttk::treeview $right_frame.tree.list -columns {user roles inherited link_type link_scope expires id} -show {tree headings} -selectmode extended \
-        -displaycolumns {user roles inherited link_type link_scope expires} \
+    set w(acl) [ttk::treeview $right_frame.tree.list -columns {user policy drive inherited link state id} -show {tree headings} -selectmode extended \
+        -displaycolumns {user policy drive inherited link state} \
         -yscrollcommand "$right_frame.tree.vscroll set" -xscrollcommand "$right_frame.tree.hscroll set"]
     pack $w(acl) -side left -fill both -expand yes
 
-    # Configure treeview columns (reduced minwidths for better initial sizing)
+    # Intended (policy) beside actual (drive), as in the design mockup
     configure_tree_columns $w(acl) {
         #0 "Email" 150 100
-        user "User" 120 80
-        roles "Roles" 70 50
-        inherited "Inherited" 60 50
-        link_type "Link Type" 70 50
-        link_scope "Link Scope" 70 50
-        expires "Expires" 100 80
+        user "User" 110 80
+        policy "Policy" 90 60
+        drive "Drive" 60 45
+        inherited "Inherit" 55 45
+        link "Link" 70 45
+        state "State" 190 120
     }
 
     # Configure tags for different permission types
@@ -431,6 +446,8 @@ proc ::ui::build_acl_pane {} {
     $w(acl) tag configure write -background lightblue
     $w(acl) tag configure read -background lightyellow
     $w(acl) tag configure inherited -background lightgray
+    $w(acl) tag configure missing -foreground red3
+    $w(acl) tag configure violation -foreground red3
 
     # Create context menu for copying email
     set w(context_menu) [menu $w(acl).context_menu -tearoff 0]
@@ -476,6 +493,569 @@ proc ::ui::build_acl_pane {} {
 
     pack $w(btn_remove) -side left -padx 2
     pack $w(btn_invite) -side left -padx 2
+}
+
+proc ::ui::build_audit_tab {} {
+    variable w
+    set t [ttk::frame $w(nb_right).audit]
+    set w(tab_audit) $t
+    $w(nb_right) add $t -text "Audit"
+
+    # Toolbar: scope, run, cancel, last-run line
+    pack [ttk::frame $t.bar] -fill x -pady {6 4} -padx 4
+    pack [ttk::label $t.bar.slabel -text "Scope:"] -side left
+    set w(audit_scope) [ttk::combobox $t.bar.scope -state readonly -width 28 \
+        -values {"Whole policy" "Selected folder and below"}]
+    $w(audit_scope) set "Whole policy"
+    pack $w(audit_scope) -side left -padx {4 8}
+    pack [ttk::button $t.bar.run -text "Run audit" -command ::ui::audit_run] -side left
+    set w(audit_cancel) [ttk::button $t.bar.cancel -text "Cancel" -state disabled \
+        -command {set ::ui::state(audit_cancel) 1}]
+    pack $w(audit_cancel) -side left -padx 4
+    set w(audit_last) [ttk::label $t.bar.last -text "No audit in this session." -foreground gray40]
+    pack $w(audit_last) -side right
+
+    # Findings view
+    set w(audit_findings_frame) [ttk::frame $t.findings]
+    pack $w(audit_findings_frame) -fill both -expand yes -padx 4
+    pack [ttk::scrollbar $t.findings.vs -orient vertical -command "$t.findings.list yview"] -side right -fill y
+    set w(findings) [ttk::treeview $t.findings.list \
+        -columns {fix person roles} -show {tree headings} -selectmode browse \
+        -yscrollcommand "$t.findings.vs set"]
+    pack $w(findings) -fill both -expand yes
+    configure_tree_columns $w(findings) {
+        #0 "Folder / finding" 340 200
+        fix "Fix" 40 30
+        person "Person" 230 140
+        roles "Expected / actual" 120 80
+    }
+    $w(findings) column fix -anchor center -stretch 0
+    $w(findings) tag configure folder -background gray92
+    $w(findings) tag configure info -background {#faf8ee}
+    $w(findings) tag configure real -foreground red3
+    bind $w(findings) <Button-1> {::ui::finding_toggle %x %y}
+
+    pack [ttk::frame $t.factions] -fill x -pady 6 -padx 4
+    set w(audit_summary) [ttk::label $t.factions.summary -text "" -foreground gray30]
+    pack $w(audit_summary) -side left
+    set w(btn_apply) [ttk::button $t.factions.apply -text "Apply fixes" -state disabled \
+        -command ::ui::audit_apply]
+    pack $w(btn_apply) -side right -padx 2
+    set w(btn_preview) [ttk::button $t.factions.preview -text "Preview fixes (dry run)" -state disabled \
+        -command ::ui::audit_preview]
+    pack $w(btn_preview) -side right -padx 2
+
+    # Diff (dry-run) view, swapped in over the findings
+    set w(audit_diff_frame) [ttk::frame $t.diff]
+    pack [ttk::label $t.diff.head -text "Dry run — nothing has changed yet" -font TkHeadingFont] \
+        -anchor w -pady {6 2} -padx 2
+    pack [ttk::scrollbar $t.diff.vs -orient vertical -command "$t.diff.list yview"] -side right -fill y
+    set w(diff) [ttk::treeview $t.diff.list -columns {who detail} -show {tree headings} \
+        -yscrollcommand "$t.diff.vs set"]
+    configure_tree_columns $w(diff) {
+        #0 "Action" 110 80
+        who "Who" 240 160
+        detail "Detail" 420 200
+    }
+    pack $w(diff) -fill both -expand yes
+    $w(diff) tag configure add -background {#d6f0d6}
+    $w(diff) tag configure del -background {#f3dede}
+    $w(diff) tag configure chg -background {#d3e6f5}
+    $w(diff) tag configure note -background {#faf8ee}
+    set w(apply_log) [text $t.diff.log -height 6 -state disabled -wrap word]
+
+    pack [ttk::frame $t.dactions] -fill x -pady 6 -padx 4
+    set w(diff_summary) [ttk::label $t.dactions.summary -text "" -foreground gray30]
+    pack $w(diff_summary) -side left
+    set w(btn_back) [ttk::button $t.dactions.back -text "Back to findings" \
+        -command {::ui::audit_show results}]
+    set w(btn_apply2) [ttk::button $t.dactions.apply -text "Apply these changes" \
+        -command ::ui::audit_apply]
+
+    ::ui::audit_show idle
+}
+
+proc ::ui::audit_show {phase} {
+    # idle | results | diff: which body the Audit tab shows
+    variable w
+    variable state
+    set state(audit_phase) $phase
+    pack forget $w(audit_findings_frame)
+    pack forget $w(audit_diff_frame)
+    pack forget $w(btn_back)
+    pack forget $w(btn_apply2)
+    if {$phase eq "diff"} {
+        pack $w(audit_diff_frame) -fill both -expand yes -padx 4 \
+            -after [winfo parent $w(audit_diff_frame)].bar
+        pack $w(btn_apply2) -side right -padx 2 -in [winfo parent $w(btn_back)]
+        pack $w(btn_back) -side right -padx 2
+    } else {
+        pack $w(audit_findings_frame) -fill both -expand yes -padx 4 \
+            -after [winfo parent $w(audit_findings_frame)].bar
+    }
+}
+
+proc ::ui::audit_scope_plans {} {
+    # The per-platform plans the chosen scope covers
+    variable w
+    variable state
+    set plans [dict get $state(model) plan]
+    if {[$w(audit_scope) get] ne "Selected folder and below"} { return $plans }
+    if {![info exists state(sel_provider)]} { return $plans }
+    set provider $state(sel_provider)
+    set sel_path [$::ui::w(path_entry) get]
+    if {$sel_path eq "" || ![dict exists $plans $provider]} { return $plans }
+    set sub {}
+    dict for {fid fentry} [dict get $plans $provider] {
+        set fpath [dict get $fentry path]
+        if {$fpath eq $sel_path || [string match "$sel_path/*" $fpath] || \
+            [string match "*$sel_path" $fpath]} {
+            dict set sub $fid $fentry
+        }
+    }
+    if {[dict size $sub] == 0} { return $plans }
+    return [dict create $provider $sub]
+}
+
+proc ::ui::audit_run {} {
+    # The same walk audit_cli does, pumping the event loop per folder so
+    # the window stays live and Cancel can interrupt.
+    variable w
+    variable state
+    if {![info exists state(model)] || $state(model) eq ""} {
+        ::ui::status "Open a policy first" red
+        return
+    }
+    set model $state(model)
+    set plans [::ui::audit_scope_plans]
+    set state(audit_cancel) 0
+    $w(audit_cancel) configure -state normal
+    set findings {}
+    set done 0
+    set total 0
+    dict for {platform subplan} $plans { incr total [dict size $subplan] }
+    set fid_violations {}
+    dict for {platform subplan} $plans {
+        if {[catch {provider_for $platform} provider]} { continue }
+        if {$platform eq "dropbox"} {
+            set ctx [::ui::dropbox_ctx]
+        } else {
+            set result [get_access_token [$w(remote_entry) get] "" "detailed" 1]
+            set token [lindex $result 0]
+            set ctx [expr {$token eq "" ? "" : [dict create token $token remote [$w(remote_entry) get]]}]
+        }
+        if {$ctx eq ""} {
+            ::ui::status "No $platform connection; skipped" red
+            continue
+        }
+        foreach fid [plan_ids_parents_first $subplan] {
+            if {$state(audit_cancel)} { break }
+            incr done
+            ::ui::status "Auditing $done/$total: [dict get $subplan $fid path]" blue
+            update
+            lassign [audit_folder $provider $ctx $fid [dict get $subplan $fid]] v _ _
+            set v [stamp_platform_person $model $platform $v]
+            lappend findings {*}$v
+            dict set fid_violations [list $platform $fid] $v
+        }
+        if {!$state(audit_cancel) && [dict exists $provider sweep] && \
+            [$w(audit_scope) get] eq "Whole policy"} {
+            lappend findings {*}[stamp_platform_person $model $platform \
+                [{*}[dict get $provider sweep] $ctx]]
+        }
+    }
+    $w(audit_cancel) configure -state disabled
+    if {$state(audit_cancel)} {
+        ::ui::status "Audit cancelled" orange
+        return
+    }
+    set state(findings) $findings
+    set state(checks) {}
+
+    # Badges, audit tier
+    dict for {pf v} $fid_violations {
+        lassign $pf platform fid
+        set real 0
+        set info 0
+        set movedn 0
+        foreach viol $v {
+            if {[violation_is_informational $viol]} {
+                if {[dict get $viol type] eq "moved"} { incr movedn } else { incr info }
+            } else {
+                incr real
+            }
+        }
+        if {$real > 0} {
+            set b "❌ $real"
+        } elseif {$movedn > 0} {
+            set b "⚠"
+        } elseif {$info > 0} {
+            set b "ℹ $info"
+        } else {
+            set b "✓"
+        }
+        set state(badge,$platform,$fid) $b
+    }
+    ::ui::badges_refresh
+    ::ui::audit_render
+    set ts [clock format [clock seconds] -format "%a %d %b %H:%M"]
+    set real 0
+    set info 0
+    foreach v $findings {
+        if {[violation_is_informational $v]} { incr info } else { incr real }
+    }
+    $w(audit_last) configure -text "Last run: $ts — $real violation(s), $info note(s)"
+    set state(audit_ts) $ts
+    ::ui::audit_persist
+    ::ui::tab_counts
+    ::ui::status "Audit finished: $real violation(s), $info note(s)" [expr {$real ? "red" : "blue"}]
+}
+
+proc ::ui::fixable {v} {
+    return [expr {[dict get $v type] in {missing_user wrong_role extra_user leaked_inherited}}]
+}
+
+proc ::ui::finding_key {v} {
+    return [list [dict get $v platform] [dict get $v id] [dict get $v email] [dict get $v type]]
+}
+
+proc ::ui::audit_render {} {
+    # Findings grouped by folder; fixable rows carry a checkbox glyph
+    variable w
+    variable state
+    foreach row [$w(findings) children {}] { $w(findings) delete $row }
+    set multi [expr {[dict size [dict get $state(model) plan]] > 1}]
+    set groups {}
+    foreach v $state(findings) {
+        set label [dict get $v path]
+        if {$multi} { set label "\[[dict get $v platform]\] $label" }
+        dict lappend groups $label $v
+    }
+    set nfix 0
+    dict for {label vlist} $groups {
+        set parent [$w(findings) insert {} end -text "📁 $label" -tags folder -open 1]
+        foreach v $vlist {
+            set who [dict get $v email]
+            if {[dict get $v person] ne ""} {
+                append who " ([identity_display $state(model) [dict get $v person]])"
+            }
+            set roles ""
+            if {[dict get $v expected] ne "" || [dict get $v actual] ne ""} {
+                set roles "[dict get $v expected] / [dict get $v actual]"
+            }
+            set label2 [::ui::finding_label $v]
+            set tags [expr {[violation_is_informational $v] ? "info" : "real"}]
+            set fix ""
+            if {[::ui::fixable $v]} {
+                set key [::ui::finding_key $v]
+                if {![dict exists $state(checks) $key]} { dict set state(checks) $key 1 }
+                set fix [expr {[dict get $state(checks) $key] ? "☑" : "☐"}]
+                incr nfix
+            }
+            $w(findings) insert $parent end -text "   $label2" \
+                -values [list $fix $who $roles] -tags $tags
+        }
+    }
+    set sel 0
+    dict for {k on} $state(checks) { if {$on} { incr sel } }
+    $w(audit_summary) configure -text \
+        "$sel fix(es) selected • notes are never changed by enforcement"
+    $w(btn_preview) configure -state [expr {$nfix ? "normal" : "disabled"}]
+    $w(btn_apply) configure -state disabled
+    ::ui::audit_show results
+}
+
+proc ::ui::finding_label {v} {
+    switch [dict get $v type] {
+        missing_user { return "❌ MISSING — expected [dict get $v expected]" }
+        wrong_role { return "❌ WRONG ROLE — direct permission exceeds entitlement" }
+        extra_user { return "❌ EXTRA — closed collection" }
+        leaked_inherited { return "❌ LEAKED — inherited beyond entitlement" }
+        open_extra { return "ℹ extra, tolerated" }
+        open_inherited { return "ℹ inherited extra, tolerated" }
+        moved { return "⚠ MOVED — [dict get $v detail]" }
+        shared_link { return "❌ LINK — [dict get $v detail]" }
+        open_link { return "ℹ link — [dict get $v detail]" }
+        phantom_share { return "ℹ [dict get $v detail]" }
+        default { return "❌ [string toupper [dict get $v type]] — [dict get $v detail]" }
+    }
+}
+
+proc ::ui::finding_toggle {x y} {
+    # Click on a finding row toggles its Fix mark; on a folder row, all its
+    # children together
+    variable w
+    variable state
+    set row [$w(findings) identify item $x $y]
+    if {$row eq ""} { return }
+    set findings_by_key {}
+    foreach v $state(findings) {
+        if {[::ui::fixable $v]} { dict set findings_by_key [::ui::finding_key $v] $v }
+    }
+    set keys {}
+    if {"folder" in [$w(findings) item $row -tags]} {
+        foreach child [$w(findings) children $row] {
+            set k [::ui::row_key $child]
+            if {$k ne ""} { lappend keys $k }
+        }
+    } else {
+        set k [::ui::row_key $row]
+        if {$k ne ""} { lappend keys $k }
+    }
+    if {[llength $keys] == 0} { return }
+    foreach k $keys {
+        dict set state(checks) $k [expr {![dict get $state(checks) $k]}]
+    }
+    ::ui::audit_render
+}
+
+proc ::ui::row_key {row} {
+    # Recover the finding behind a rendered row by position
+    variable w
+    variable state
+    set parent [$w(findings) parent $row]
+    if {$parent eq ""} { return "" }
+    set label [$w(findings) item $parent -text]
+    set idx [lsearch -exact [$w(findings) children $parent] $row]
+    set multi [expr {[dict size [dict get $state(model) plan]] > 1}]
+    set i -1
+    foreach v $state(findings) {
+        set l [dict get $v path]
+        if {$multi} { set l "\[[dict get $v platform]\] $l" }
+        if {"📁 $l" ne $label} { continue }
+        incr i
+        if {$i == $idx} {
+            if {[::ui::fixable $v]} { return [::ui::finding_key $v] }
+            return ""
+        }
+    }
+    return ""
+}
+
+proc ::ui::checked_by_folder {} {
+    # platform,fid -> list of {email type} pairs, from the ticked findings
+    variable state
+    set by {}
+    dict for {key on} $state(checks) {
+        if {!$on} { continue }
+        lassign $key platform fid email type
+        dict lappend by [list $platform $fid] [list $email $type]
+    }
+    return $by
+}
+
+proc ::ui::audit_preview {} {
+    # A fresh single-folder audit per ticked folder feeds enforce_actions;
+    # the diff shows exactly what Apply would do, plus the cascade re-checks
+    variable w
+    variable state
+    set by [::ui::checked_by_folder]
+    if {[dict size $by] == 0} {
+        ::ui::status "Nothing ticked" orange
+        return
+    }
+    foreach row [$w(diff) children {}] { $w(diff) delete $row }
+    set model $state(model)
+    set n 0
+    set folders 0
+    set state(diff_plan) {}
+    dict for {pf only} $by {
+        lassign $pf platform fid
+        if {![dict exists $model plan $platform $fid]} { continue }
+        set fentry [dict get $model plan $platform $fid]
+        incr folders
+        set violations {}
+        foreach v $state(findings) {
+            if {[dict get $v platform] eq $platform && [dict get $v id] eq $fid} {
+                lappend violations $v
+            }
+        }
+        foreach a [enforce_actions $fid $fentry $violations $only] {
+            set verb [dict get $a verb]
+            set tag [dict create invite add reinvite chg remove del sever del]
+            set detail ""
+            switch $verb {
+                invite { set detail "[dict get $a role] on [dict get $a path] (quiet, no notification)" }
+                reinvite { set detail "→ [dict get $a role] on [dict get $a path] — remove and re-invite" }
+                remove { set detail "on [dict get $a path] — direct permission" }
+                sever { set detail "inherited on [dict get $a path] — needs severing at the source" }
+            }
+            $w(diff) insert {} end -text $verb \
+                -values [list [dict get $a email] $detail] -tags [dict get $tag $verb]
+            incr n
+        }
+        dict set state(diff_plan) $pf $only
+        # Cascade: descendants of this folder get re-checked after a change
+        set fpath [dict get $fentry path]
+        set kids 0
+        dict for {ofid ofentry} [dict get $model plan $platform] {
+            if {$ofid eq $fid} { continue }
+            if {[string match "$fpath/*" [dict get $ofentry path]]} { incr kids }
+        }
+        if {$kids > 0} {
+            $w(diff) insert {} end -text "re-check" \
+                -values [list "descendants of $fpath" "$kids policy folder(s), for leaked copies after the change"] \
+                -tags note
+        }
+    }
+    $w(diff_summary) configure -text \
+        "$n planned change(s) on $folders folder(s) • owner permissions are never touched"
+    ::ui::audit_show diff
+}
+
+proc ::ui::audit_apply {} {
+    # The ticked fixes, for real: per-folder enforcement with the same
+    # engine the CLI uses, then the cascade repair pass, then a re-audit.
+    variable w
+    variable state
+    set by $state(diff_plan)
+    if {![info exists state(diff_plan)] || [dict size $by] == 0} {
+        ::ui::status "Preview first" orange
+        return
+    }
+    set total 0
+    dict for {pf only} $by { incr total [llength $only] }
+    set response [tk_messageBox -type yesno -icon warning -title "Apply fixes" \
+        -message "Apply $total fix(es) to [dict size $by] folder(s)?\n\nRemovals cannot be undone."]
+    if {$response ne "yes"} { return }
+
+    # Write-capable connections per platform
+    set model $state(model)
+    set ctxs {}
+    set providers {}
+    dict for {pf only} $by {
+        lassign $pf platform fid
+        if {[dict exists $ctxs $platform]} { continue }
+        set provider [provider_for $platform]
+        if {![dict exists $provider invite]} {
+            ::ui::status "$platform provider audits only; cannot apply" red
+            return
+        }
+        if {$platform eq "onedrive"} {
+            if {![ensure_edit_capability]} { return }
+            set ctx [od_connect [$w(remote_entry) get] write]
+        } else {
+            set ctx [dbx_connect [platform_remote $platform ""] write]
+        }
+        if {$ctx eq ""} {
+            ::ui::status "No $platform write connection" red
+            return
+        }
+        dict set providers $platform $provider
+        dict set ctxs $platform $ctx
+    }
+
+    # Stream enforcement output into the log pane under the diff
+    pack $w(apply_log) -fill x -pady {4 0}
+    $w(apply_log) configure -state normal
+    $w(apply_log) delete 1.0 end
+    $w(apply_log) configure -state disabled
+    set ::enforce_log_cmd ::ui::apply_log_line
+    set changed {}
+    dict for {pf only} $by {
+        lassign $pf platform fid
+        set fentry [dict get $model plan $platform $fid]
+        ::ui::apply_log_line "📁 [dict get $fentry path]"
+        update
+        lassign [enforce_folder [dict get $providers $platform] [dict get $ctxs $platform] \
+            $fid $fentry 0 $only] status was_changed _ _
+        if {$was_changed} { lappend changed [list $platform [dict get $fentry path]] }
+        set state(badge,$platform,$fid) ""
+        update
+    }
+    # Cascade repair pass, exactly the CLI's rule
+    set repair {}
+    dict for {platform subplan} [dict get $model plan] {
+        if {![dict exists $providers $platform]} { continue }
+        dict for {fid fentry} $subplan {
+            set fpath [dict get $fentry path]
+            foreach cp $changed {
+                lassign $cp cplatform cpath
+                if {$cplatform ne $platform || $cpath eq $fpath} { continue }
+                if {$cpath eq "/" || [string match "$cpath/*" $fpath]} {
+                    if {[list $platform $fid] ni $repair} { lappend repair [list $platform $fid] }
+                    break
+                }
+            }
+        }
+    }
+    foreach pf $repair {
+        lassign $pf platform fid
+        set fentry [dict get $model plan $platform $fid]
+        ::ui::apply_log_line "🔁 re-checking [dict get $fentry path]"
+        update
+        enforce_folder [dict get $providers $platform] [dict get $ctxs $platform] $fid $fentry 0
+        set state(badge,$platform,$fid) ""
+        update
+    }
+    set ::enforce_log_cmd ""
+    ::ui::apply_log_line "Done. Re-auditing…"
+    update
+    set state(diff_plan) {}
+    ::ui::audit_run
+    pack forget $w(apply_log)
+}
+
+proc ::ui::apply_log_line {msg} {
+    variable w
+    $w(apply_log) configure -state normal
+    $w(apply_log) insert end "$msg\n"
+    $w(apply_log) see end
+    $w(apply_log) configure -state disabled
+}
+
+proc ::ui::tab_counts {} {
+    # Violation and identity counts on the tab labels
+    variable w
+    variable state
+    set real 0
+    if {[info exists state(findings)]} {
+        foreach v $state(findings) {
+            if {![violation_is_informational $v]} { incr real }
+        }
+    }
+    set label "Audit"
+    if {$real > 0} { append label " ❌ $real" }
+    $w(nb_right) tab $w(tab_audit) -text $label
+}
+
+proc ::ui::audit_cache_file {} {
+    variable state
+    set hash [format %08x [zlib crc32 [encoding convertto utf-8 $state(policy_path)]]]
+    return [file join $::env(HOME) .cache acl-manager audit-$hash.tcl]
+}
+
+proc ::ui::audit_persist {} {
+    # Badges and the last-run stamp survive the session
+    variable state
+    catch {
+        file mkdir [file dirname [::ui::audit_cache_file]]
+        set f [open [::ui::audit_cache_file] w]
+        fconfigure $f -encoding utf-8
+        set badges {}
+        foreach name [array names state badge,*] {
+            dict set badges $name $state($name)
+        }
+        puts $f [list $state(audit_ts) $badges]
+        close $f
+    }
+}
+
+proc ::ui::audit_restore {} {
+    # A previous run's badges, so a fresh session opens informed
+    variable w
+    variable state
+    catch {
+        set f [open [::ui::audit_cache_file] r]
+        fconfigure $f -encoding utf-8
+        lassign [read $f] ts badges
+        close $f
+        dict for {name b} $badges { set state($name) $b }
+        if {$ts ne ""} {
+            $w(audit_last) configure -text "Last run: $ts (earlier session)"
+        }
+        ::ui::badges_refresh
+    }
 }
 
 proc ::ui::build_status {} {
@@ -573,15 +1153,17 @@ proc load_tree_children {tree parent_item} {
     foreach e $folders {
         set folder_item [$tree insert $parent_item end \
             -text [dict get $e name] \
-            -values [list [dict get $e id] "folder" 0 $provider]]
+            -values [list [dict get $e id] "folder" 0 $provider \
+                [::ui::badge_for $provider [dict get $e id]]]]
         $tree insert $folder_item end -text ""
     }
     foreach e $files {
         $tree insert $parent_item end \
             -text [dict get $e name] \
-            -values [list [dict get $e id] "file" 1 $provider]
+            -values [list [dict get $e id] "file" 1 $provider ""]
     }
-    $tree item $parent_item -values [list $folder_id $type 1 $provider]
+    set badge [lindex $values 4]
+    $tree item $parent_item -values [list $folder_id $type 1 $provider $badge]
     debug_log "Tree children loaded: [llength $folders] folders, [llength $files] files"
 }
 
@@ -1670,6 +2252,7 @@ proc on_remove_selected_click {} {
     foreach item $selection {
         set values [$tree item $item -values]
         set permission_id [lindex $values 6]
+        if {$permission_id eq ""} { continue }
 
         set remove_result [remove_permission $current_item_id $permission_id $access_token]
         set remove_status [lindex $remove_result 0]
@@ -2326,6 +2909,116 @@ proc scan_shared_folders_user_impl {item_id user_email max_depth item_type remot
 # Returns: {status permissions} where status is "ok" or error message
 
 # GUI wrapper: Fetch ACL and update GUI widgets
+proc ::ui::badge_for {provider fid} {
+    # Two tiers: the policy tier is free (governed vs not); the audit tier
+    # is written only by audit runs and cached in state(badge,provider,fid).
+    variable state
+    if {[info exists state(badge,$provider,$fid)]} {
+        return $state(badge,$provider,$fid)
+    }
+    if {![info exists state(model)] || $state(model) eq ""} { return "" }
+    if {[dict exists $state(model) plan $provider $fid]} { return "\u00b7" }
+    return "\u2013"
+}
+
+proc ::ui::badges_refresh {{root {}}} {
+    # Re-stamp the badge cell of every loaded tree row (policy reload,
+    # audit results). Cheap: dict lookups over already-loaded nodes.
+    variable w
+    foreach item [$w(tree) children $root] {
+        set values [$w(tree) item $item -values]
+        if {[llength $values] >= 4 && [lindex $values 1] eq "folder"} {
+            set provider [lindex $values 3]
+            set fid [lindex $values 0]
+            if {$fid ni {root {}}} {
+                lset values 4 [::ui::badge_for $provider $fid]
+                $w(tree) item $item -values $values
+            }
+        }
+        ::ui::badges_refresh $item
+    }
+}
+
+proc ::ui::entitlement_summary {model platform fid} {
+    # "groupA (write), groupB (read)" for the folder, from the raw grants
+    set raw [dict get $model raw]
+    set parts {}
+    foreach grant [dict get $raw grants] {
+        set role "read"
+        foreach r [dict get $grant roles] { if {$r eq "write"} { set role "write" } }
+        if {[catch {policy_v2_resolve_collection [dict get $raw collections] \
+                [dict get $grant collection] {}} folders]} { continue }
+        foreach f $folders {
+            if {[dict get $f platform] eq $platform && [dict get $f id] eq $fid} {
+                lappend parts "[dict get $grant group] ($role)"
+                break
+            }
+        }
+    }
+    return [join $parts ", "]
+}
+
+proc ::ui::update_governed {platform fid} {
+    # The governed-by line under the Item entry
+    variable w
+    variable state
+    if {![info exists state(model)] || $state(model) eq ""} {
+        $w(governed) configure -text "No policy loaded." -foreground gray40
+        return
+    }
+    set model $state(model)
+    if {![dict exists $model plan $platform $fid]} {
+        $w(governed) configure -foreground gray30 -text \
+            "Governed by nothing: this folder is in no collection, so the audit does not check it. Its access is whatever the drive says."
+        return
+    }
+    set fentry [dict get $model plan $platform $fid]
+    set cname [dict get $fentry collection]
+    set closed [expr {[dict get $fentry closed] ? " (closed)" : ""}]
+    set ent [::ui::entitlement_summary $model $platform $fid]
+    set text "Governed by: $cname$closed"
+    if {$ent ne ""} { append text "  \u2014 entitled: $ent" }
+    if {[dict get $fentry closed]} { append text "; inheritance severed" }
+    $w(governed) configure -foreground black -text $text
+}
+
+proc ::ui::state_cell {violations email} {
+    # {text tag} for the State column from this folder's audit findings
+    foreach v $violations {
+        if {[dict get $v email] ne $email} { continue }
+        switch [dict get $v type] {
+            wrong_role { return [list "\u274c WRONG ROLE \u2014 exceeds entitlement" violation] }
+            extra_user { return [list "\u274c EXTRA \u2014 closed collection" violation] }
+            leaked_inherited { return [list "\u274c LEAKED \u2014 severs inheritance" violation] }
+            open_extra { return [list "\u2139 extra, tolerated" {}] }
+            open_inherited { return [list "\u2139 inherited extra, tolerated" {}] }
+            missing_user { return [list "\u274c MISSING \u2014 invite as [dict get $v expected]" missing] }
+        }
+    }
+    return [list "\u2713 matches policy" {}]
+}
+
+proc ::ui::audit_one_folder {platform fid} {
+    # This folder's violations, or "" when it is ungoverned or offline.
+    # Runs the same audit_folder the CLI uses, through the platform's
+    # provider, so the Access tab can never disagree with the audit.
+    variable state
+    if {![info exists state(model)] || $state(model) eq ""} { return "" }
+    if {![dict exists $state(model) plan $platform $fid]} { return "" }
+    set provider [provider_for $platform]
+    if {$platform eq "dropbox"} {
+        set ctx [::ui::dropbox_ctx]
+    } else {
+        set result [get_access_token [$::ui::w(remote_entry) get] "" "detailed" 1]
+        set token [lindex $result 0]
+        if {$token eq ""} { return "" }
+        set ctx [dict create token $token remote [$::ui::w(remote_entry) get]]
+    }
+    if {$ctx eq ""} { return "" }
+    lassign [audit_folder $provider $ctx $fid [dict get $state(model) plan $platform $fid]] violations _ _
+    return $violations
+}
+
 proc gui_fetch_acl_dropbox {fid} {
     # Fill the ACL table from the Dropbox provider's normalized view:
     # members split direct/inherited, then any shared links as rows of
@@ -2356,27 +3049,58 @@ proc gui_fetch_acl_dropbox {fid} {
     $::ui::w(item_entry) insert 0 $path
     $::ui::w(item_entry) configure -state readonly
 
+    ::ui::update_governed dropbox $fid
     set model ""
     if {[info exists ::ui::state(model)]} { set model $::ui::state(model) }
+    set violations [::ui::audit_one_folder dropbox $fid]
+    set bound {}
+    set governed 0
+    if {$model ne "" && [dict exists $model plan dropbox $fid]} {
+        set governed 1
+        set bound [dict get $model plan dropbox $fid expected]
+    }
+
     set rows 0
+    set seen {}
     foreach {source inherited_str} {direct No inherited Yes} {
         foreach email [lsort [dict keys [dict get $acl $source]]] {
             set role [dict get $acl $source $email]
+            dict set seen $email 1
             set who ""
             if {$model ne ""} {
                 set who [identity_display $model [identity_person_for $model dropbox $email]]
             }
+            set policy_cell "\u2014"
+            if {[dict exists $bound $email]} { set policy_cell [dict get $bound $email] }
+            if {$governed} {
+                lassign [::ui::state_cell $violations $email] state_cell state_tag
+            } else {
+                set state_cell [expr {$model eq "" ? "" : "not audited"}]
+                set state_tag {}
+            }
             set tags [list $role]
             if {$source eq "inherited"} { lappend tags inherited }
+            if {$state_tag ne ""} { lappend tags $state_tag }
             $acl_tree insert {} end -text $email \
-                -values [list $who $role $inherited_str "" "" "" ""] \
+                -values [list $who $policy_cell $role $inherited_str "-" $state_cell ""] \
                 -tags $tags
             incr rows
         }
     }
+    dict for {email role} $bound {
+        if {[dict exists $seen $email]} { continue }
+        set who ""
+        if {$model ne ""} {
+            set who [identity_display $model [identity_person_for $model dropbox $email]]
+        }
+        $acl_tree insert {} end -text $email \
+            -values [list $who $role "\u2014" "\u2014" "-" "\u274c MISSING \u2014 invite as $role" ""] \
+            -tags missing
+        incr rows
+    }
     foreach link [dict get $acl links] {
         $acl_tree insert {} end -text "(shared link)" \
-            -values [list "anyone with the URL" read No link "" "" ""] \
+            -values [list "anyone with the URL" "\u2014" read No link "" ""] \
             -tags read
         incr rows
     }
@@ -2497,61 +3221,106 @@ proc gui_fetch_acl {item_id remote_name} {
         }}
     } $permissions]
 
-    # Populate treeview (filter out owner permissions)
+    # The policy's view of this folder: entitlements, plus the same audit
+    # findings the CLI would report, merged into the table's State column
+    ::ui::update_governed onedrive $item_id
+    set model ""
+    if {[info exists ::ui::state(model)]} { set model $::ui::state(model) }
+    set violations [::ui::audit_one_folder onedrive $item_id]
+    set bound {}
+    if {$model ne "" && [dict exists $model plan onedrive $item_id]} {
+        set bound [dict get $model plan onedrive $item_id expected]
+    }
+    set governed [expr {$model ne "" && [dict exists $model plan onedrive $item_id]}]
+
+    # Populate treeview; the owner rows stay visible but carry no
+    # permission id, which is what keeps them out of removal
+    set seen_emails {}
     foreach perm $sorted_permissions {
         set roles [dict get $perm roles]
+        set is_owner [expr {[lsearch $roles "owner"] >= 0}]
 
-        # Skip owner permissions - they can't be removed and OneDrive doesn't show them
-        if {[lsearch $roles "owner"] >= 0} {
-            continue
-        }
+        set perm_id [expr {$is_owner ? "" : [dict get $perm id]}]
 
-        set perm_id [dict get $perm id]
-        set roles_str [join $roles ", "]
-
-        # Get user information
+        # Get user information; the policy's person name beats the drive's
+        # display name (accounts get relabeled by their users)
         lassign [extract_user_info $perm] user_name user_email
+        set email_lower [string tolower $user_email]
+        dict set seen_emails $email_lower 1
+        if {$model ne ""} {
+            set slug [identity_person_for $model onedrive $email_lower]
+            if {$slug ne ""} { set user_name [identity_display $model $slug] }
+        }
 
-        # Get link information
-        set link_type "N/A"
-        set link_scope "N/A"
+        # Drive-actual role, normalized like the audit sees it
+        if {$is_owner} {
+            set drive_role "owner"
+        } elseif {[lsearch $roles "write"] >= 0} {
+            set drive_role "write"
+        } else {
+            set drive_role "read"
+        }
+
+        # Policy-intended role
+        set policy_cell "\u2014"
+        if {[dict exists $bound $email_lower]} {
+            set policy_cell [dict get $bound $email_lower]
+        } elseif {$model ne "" && !$governed} {
+            set policy_cell "\u2014 not governed"
+        }
+
+        # Link column
+        set link_cell "-"
         if {[dict exists $perm link]} {
-            set link [dict get $perm link]
-            if {[dict exists $link type]} {
-                set link_type [dict get $link type]
-            }
-            if {[dict exists $link scope]} {
-                set link_scope [dict get $link scope]
-            }
+            set lt ""
+            set lsc ""
+            catch {set lt [dict get $perm link type]}
+            catch {set lsc [dict get $perm link scope]}
+            set link_cell [string trim "$lt/$lsc" /]
         }
 
-        # Get expiration
-        set expires "N/A"
-        if {[dict exists $perm expirationDateTime]} {
-            set expires [dict get $perm expirationDateTime]
-        }
-
-        # Check if inherited
         set is_inherited [is_inherited_permission $perm]
         set inherited_str [expr {$is_inherited ? "Yes" : "No"}]
 
-        # Determine tag based on roles and inheritance
+        # State from the audit, person-blind rows kept honest
+        if {$is_owner} {
+            set state_cell "owner"
+            set state_tag {}
+        } elseif {!$governed} {
+            set state_cell [expr {$model eq "" ? "" : "not audited"}]
+            set state_tag {}
+        } else {
+            lassign [::ui::state_cell $violations $email_lower] state_cell state_tag
+        }
+
         set tags [list]
-        if {[lsearch $roles "read"] >= 0} {
+        if {$is_owner} {
+            lappend tags "owner"
+        } elseif {[lsearch $roles "read"] >= 0} {
             lappend tags "read"
         } else {
             lappend tags "write"
         }
-        if {$is_inherited} {
-            lappend tags "inherited"
-        }
+        if {$is_inherited} { lappend tags "inherited" }
+        if {$state_tag ne ""} { lappend tags $state_tag }
 
-        # Insert into treeview (email in tree column, reordered data columns)
         $acl_tree insert {} end -text $user_email \
-            -values [list $user_name $roles_str $inherited_str $link_type $link_scope $expires $perm_id] \
+            -values [list $user_name $policy_cell $drive_role $inherited_str $link_cell $state_cell $perm_id] \
             -tags $tags
     }
-    
+
+    # Entitled people the drive does not know yet: synthetic MISSING rows
+    dict for {email role} $bound {
+        if {[dict exists $seen_emails $email]} { continue }
+        set who ""
+        if {$model ne ""} {
+            set who [identity_display $model [identity_person_for $model onedrive $email]]
+        }
+        $acl_tree insert {} end -text $email \
+            -values [list $who $role "\u2014" "\u2014" "-" "\u274c MISSING \u2014 invite as $role" ""] \
+            -tags missing
+    }
+
     # Enable invite button now that ACL is loaded
     $::ui::w(btn_invite) configure -state normal
 
