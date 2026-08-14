@@ -70,15 +70,18 @@ set ignore_patterns [list \
 set ::serverSock           ""
 set ::oauth_modal_result   0  ;# Result from OAuth modal dialog (0=failure/cancel, 1=success)
 
-# GUI widget variables (will be set in GUI mode)
-set remote_entry ""
-set url_entry ""
-set action_buttons_frame ""
-
 # Treeview browser variables
 set selected_item {}      ;# Currently selected item {id is_folder}
-set fetch_button ""       ;# Fetch ACL button widget
-set acl_path_label ""     ;# Label showing path of current ACL display
+
+# GUI widget handles live here instead of as scattered globals: ::ui::w(name)
+# holds the widget path for anything the rest of the file needs to reach, and
+# ::ui::state is free for any other GUI-only state that isn't a widget.
+namespace eval ::ui {
+    variable w
+    array set w {}
+    variable state
+    array set state {}
+}
 
 # Tk 9 carries characters outside the BMP to the X11 clipboard intact, so a
 # path holding an emoji copies as itself.
@@ -103,50 +106,70 @@ if {$argc == 0 || $argv eq {-debug}} {
     }
 }
 
-if {[info commands tk] ne ""} {
+# Helper function to configure treeview columns
+proc configure_tree_columns {tree columns} {
+    foreach {col_id heading width minwidth} $columns {
+        $tree heading $col_id -text $heading
+        $tree column $col_id -width $width -minwidth $minwidth
+    }
+}
+
+# Tk commands inside a proc resolve when the proc is called, not when it is
+# defined, so these build procs are safe to define unconditionally even
+# though they only ever run once Tk is confirmed loaded (see ::ui::start).
+
+proc ::ui::build {} {
+    variable w
+
     # Stated rather than assumed. Tk 9 provides Ttk as it loads, and the
     # browser is also reachable by starting the script under wish, which
     # never passes through the block above.
     package require Ttk
 
-    # Declare global widget variables
-    global remote_entry url_entry fetch_button acl_path_label selected_item action_buttons_frame f
-    
     # Create main window
     wm title . "OneDrive ACL Lister"
 
     # Handle window close during OAuth flow
     wm protocol . WM_DELETE_WINDOW {
         global serverSock oauth
-        
+
         # Clean up OAuth server if running
         if {[info exists serverSock] && $serverSock ne ""} {
             catch {close $serverSock}
             set serverSock ""
             debug_log "Closed OAuth server socket due to window close"
         }
-        
+
         # Signal OAuth flow to stop by setting a cancel flag
         if {[info exists oauth(auth_code)] && $oauth(auth_code) eq ""} {
             set oauth(auth_code) "CANCELLED"
             debug_log "OAuth flow cancelled by user (window closed)"
         }
-        
+
         # Exit cleanly
         destroy .
     }
 
-    # Helper function to configure treeview columns
-    proc configure_tree_columns {tree columns} {
-        foreach {col_id heading width minwidth} $columns {
-            $tree heading $col_id -text $heading
-            $tree column $col_id -width $width -minwidth $minwidth
-        }
-    }
-
     # Create main frame
-    set f [ttk::frame .main]
-    pack $f -fill both -expand yes -padx 10 -pady 10
+    set w(root_frame) [ttk::frame .main]
+    pack $w(root_frame) -fill both -expand yes -padx 10 -pady 10
+
+    ::ui::build_addressbar
+
+    # MAIN CONTENT: Left-Right Split Layout
+
+    # Create horizontal panedwindow for left-middle-right layout
+    pack [ttk::panedwindow $w(root_frame).paned -orient horizontal] -fill both -expand yes -pady {0 10}
+    set w(paned) $w(root_frame).paned
+
+    ::ui::build_browser
+    ::ui::build_acl_pane
+    ::ui::build_status
+}
+
+proc ::ui::build_addressbar {} {
+    variable w
+    set f $w(root_frame)
 
     # Create input frame (top section)
     pack [ttk::frame $f.input] -fill x -pady {0 10}
@@ -155,39 +178,38 @@ if {[info commands tk] ne ""} {
     pack [ttk::frame $f.input.url] -fill x -pady 2
     ttk::label $f.input.url.label -text "URL:"
     pack $f.input.url.label -side left
-    set url_entry [ttk::entry $f.input.url.entry -width 60]
-    pack $url_entry -side left -fill x -expand yes -padx {5 0}
-    $url_entry insert 0 "https://onedrive.live.com/?id=root"
-    $url_entry configure -state readonly
+    set w(url_entry) [ttk::entry $f.input.url.entry -width 60]
+    pack $w(url_entry) -side left -fill x -expand yes -padx {5 0}
+    $w(url_entry) insert 0 "https://onedrive.live.com/?id=root"
+    $w(url_entry) configure -state readonly
 
     # Path bar showing hierarchical path from root
     pack [ttk::frame $f.input.path] -fill x -pady 2
     ttk::label $f.input.path.label -text "Path:"
     pack $f.input.path.label -side left
-    set path_entry [ttk::entry $f.input.path.entry -width 60]
-    pack $path_entry -side left -fill x -expand yes -padx {5 0}
-    $path_entry insert 0 ""
-    $path_entry configure -state readonly
+    set w(path_entry) [ttk::entry $f.input.path.entry -width 60]
+    pack $w(path_entry) -side left -fill x -expand yes -padx {5 0}
+    $w(path_entry) insert 0 ""
+    $w(path_entry) configure -state readonly
 
     # Copy path button (workaround for Tk 8.x emoji clipboard bug)
     button $f.input.path.copy -text "Copy" -command {
-        copy_to_clipboard [$::f.input.path.entry get]
+        copy_to_clipboard [$::ui::w(path_entry) get]
     }
     pack $f.input.path.copy -side left -padx {5 0}
 
     # Hidden remote name entry (for rclone configuration)
-    set remote_entry [ttk::entry $f.input.remote_hidden -width 20]
-    $remote_entry insert 0 "OneDrive"
+    set w(remote_entry) [ttk::entry $f.input.remote_hidden -width 20]
+    $w(remote_entry) insert 0 "OneDrive"
     # Don't pack this - it's hidden
+}
 
-    # MAIN CONTENT: Left-Right Split Layout
-
-    # Create horizontal panedwindow for left-middle-right layout
-    pack [ttk::panedwindow $f.paned -orient horizontal] -fill both -expand yes -pady {0 10}
+proc ::ui::build_browser {} {
+    variable w
 
     # LEFT PANE: Browser
-    set left_frame [ttk::frame $f.paned.browser]
-    $f.paned add $left_frame -weight 1
+    set left_frame [ttk::frame $w(paned).browser]
+    $w(paned) add $left_frame -weight 1
 
     ttk::label $left_frame.label -text "Browse OneDrive:"
     pack $left_frame.label -anchor w -pady {0 5}
@@ -196,24 +218,24 @@ if {[info commands tk] ne ""} {
     pack [ttk::scrollbar $left_frame.hscroll -orient horizontal -command "$left_frame.tree xview"] -side bottom -fill x
     pack [ttk::scrollbar $left_frame.vscroll -orient vertical -command "$left_frame.tree yview"] -side right -fill y
 
-    set browser_tree [ttk::treeview $left_frame.tree \
+    set w(tree) [ttk::treeview $left_frame.tree \
         -columns {item_id type loaded} -show tree \
         -selectmode browse \
         -yscrollcommand "$left_frame.vscroll set" \
         -xscrollcommand "$left_frame.hscroll set"]
-    pack $browser_tree -side left -fill both -expand yes
+    pack $w(tree) -side left -fill both -expand yes
 
     # Hide metadata columns (used internally)
-    $browser_tree column item_id -width 0 -stretch 0
-    $browser_tree column type -width 0 -stretch 0
-    $browser_tree column loaded -width 0 -stretch 0
+    $w(tree) column item_id -width 0 -stretch 0
+    $w(tree) column type -width 0 -stretch 0
+    $w(tree) column loaded -width 0 -stretch 0
 
     # Bind events for selection and expansion
-    bind $browser_tree <<TreeviewSelect>> {on_tree_select $browser_tree}
-    bind $browser_tree <<TreeviewOpen>> {on_tree_expand $browser_tree [%W focus]}
+    bind $w(tree) <<TreeviewSelect>> {on_tree_select $::ui::w(tree)}
+    bind $w(tree) <<TreeviewOpen>> {on_tree_expand $::ui::w(tree) [%W focus]}
 
     # Bind double-click to toggle folder expansion
-    bind $browser_tree <Double-Button-1> {
+    bind $w(tree) <Double-Button-1> {
         set item [%W identify item %x %y]
         if {$item ne ""} {
             set values [%W item $item -values]
@@ -231,15 +253,19 @@ if {[info commands tk] ne ""} {
     }
 
     # Insert root item with dummy child to show expand arrow
-    set root_item [$browser_tree insert {} end -text "OneDrive Root" -values [list "root" "folder" 0]]
-    $browser_tree insert $root_item end -text ""  ;# Dummy child for expand arrow
+    set root_item [$w(tree) insert {} end -text "OneDrive Root" -values [list "root" "folder" 0]]
+    $w(tree) insert $root_item end -text ""  ;# Dummy child for expand arrow
+}
+
+proc ::ui::build_acl_pane {} {
+    variable w
 
     # RIGHT PANE: ACL Display
-    set right_frame [ttk::frame $f.paned.acl]
-    $f.paned add $right_frame -weight 2
+    set right_frame [ttk::frame $w(paned).acl]
+    $w(paned) add $right_frame -weight 2
 
     # Set initial sash position after window is mapped (gives 35% to left, 65% to right)
-    bind $f.paned <Map> {
+    bind $w(paned) <Map> {
         after idle {
             if {[winfo exists .main.paned]} {
                 set total_width [winfo width .main.paned]
@@ -252,17 +278,17 @@ if {[info commands tk] ne ""} {
     }
 
     # Fetch button at top of right pane
-    set fetch_button [ttk::button $right_frame.fetch -text "Fetch ACL" \
+    set w(fetch) [ttk::button $right_frame.fetch -text "Fetch ACL" \
         -command on_fetch_button_click -state disabled]
-    pack $fetch_button -anchor w -pady {0 5}
+    pack $w(fetch) -anchor w -pady {0 5}
 
     # ACL path label (shows which item's ACL is displayed)
     pack [ttk::frame $right_frame.path] -fill x -pady {0 5}
     ttk::label $right_frame.path.label -text "Item:"
     pack $right_frame.path.label -side left
-    set acl_path_label [ttk::entry $right_frame.path.entry]
-    pack $acl_path_label -side left -fill x -expand yes -padx {5 0}
-    $acl_path_label configure -state readonly
+    set w(item_entry) [ttk::entry $right_frame.path.entry]
+    pack $w(item_entry) -side left -fill x -expand yes -padx {5 0}
+    $w(item_entry) configure -state readonly
 
     # Create treeview frame for ACL display
     pack [ttk::frame $right_frame.tree] -fill both -expand yes
@@ -272,13 +298,13 @@ if {[info commands tk] ne ""} {
     pack [ttk::scrollbar $right_frame.tree.vscroll -orient vertical -command "$right_frame.tree.list yview"] -side right -fill y
 
     # Treeview widget (with multi-select enabled)
-    set acl_tree [ttk::treeview $right_frame.tree.list -columns {user roles inherited link_type link_scope expires id} -show {tree headings} -selectmode extended \
+    set w(acl) [ttk::treeview $right_frame.tree.list -columns {user roles inherited link_type link_scope expires id} -show {tree headings} -selectmode extended \
         -displaycolumns {user roles inherited link_type link_scope expires} \
         -yscrollcommand "$right_frame.tree.vscroll set" -xscrollcommand "$right_frame.tree.hscroll set"]
-    pack $acl_tree -side left -fill both -expand yes
+    pack $w(acl) -side left -fill both -expand yes
 
     # Configure treeview columns (reduced minwidths for better initial sizing)
-    configure_tree_columns $acl_tree {
+    configure_tree_columns $w(acl) {
         #0 "Email" 150 100
         user "User" 120 80
         roles "Roles" 70 50
@@ -289,15 +315,15 @@ if {[info commands tk] ne ""} {
     }
 
     # Configure tags for different permission types
-    $acl_tree tag configure owner -background lightgreen
-    $acl_tree tag configure write -background lightblue
-    $acl_tree tag configure read -background lightyellow
-    $acl_tree tag configure inherited -background lightgray
+    $w(acl) tag configure owner -background lightgreen
+    $w(acl) tag configure write -background lightblue
+    $w(acl) tag configure read -background lightyellow
+    $w(acl) tag configure inherited -background lightgray
 
     # Create context menu for copying email
-    menu $acl_tree.context_menu -tearoff 0
-    $acl_tree.context_menu add command -label "Copy Email" -command {
-        set acl_tree $::f.paned.acl.tree.list
+    set w(context_menu) [menu $w(acl).context_menu -tearoff 0]
+    $w(context_menu) add command -label "Copy Email" -command {
+        set acl_tree $::ui::w(acl)
         set selection [$acl_tree selection]
         if {[llength $selection] > 0} {
             set item [lindex $selection 0]
@@ -308,7 +334,7 @@ if {[info commands tk] ne ""} {
     }
 
     # Bind right-click to show context menu
-    bind $acl_tree <Button-3> {
+    bind $w(acl) <Button-3> {
         set acl_tree %W
         set item [%W identify item %x %y]
         if {$item ne ""} {
@@ -317,24 +343,51 @@ if {[info commands tk] ne ""} {
         }
     }
 
+    # Bind treeview selection event to enable/disable Remove button. Bound
+    # once here rather than re-bound on every fetch.
+    bind $w(acl) <<TreeviewSelect>> {
+        set acl_tree $::ui::w(acl)
+        set selection [$acl_tree selection]
+        if {[llength $selection] > 0} {
+            $::ui::w(btn_remove) configure -state normal
+        } else {
+            $::ui::w(btn_remove) configure -state disabled
+        }
+    }
+
     # Action buttons frame at bottom of right pane
-    set action_buttons_frame [ttk::frame $right_frame.actions]
-    pack $action_buttons_frame -side bottom -fill x -pady {10 0}
+    set w(action_frame) [ttk::frame $right_frame.actions]
+    pack $w(action_frame) -side bottom -fill x -pady {10 0}
 
-    ttk::button $action_buttons_frame.remove -text "Remove Selected" -command on_remove_selected_click -state disabled
-    ttk::button $action_buttons_frame.invite -text "Invite User" -command on_invite_user_click -state disabled
+    set w(btn_remove) [ttk::button $right_frame.actions.remove -text "Remove Selected" -command on_remove_selected_click -state disabled]
+    set w(btn_invite) [ttk::button $right_frame.actions.invite -text "Invite User" -command on_invite_user_click -state disabled]
 
-    pack $action_buttons_frame.remove -side left -padx 2
-    pack $action_buttons_frame.invite -side left -padx 2
+    pack $w(btn_remove) -side left -padx 2
+    pack $w(btn_invite) -side left -padx 2
+}
+
+proc ::ui::build_status {} {
+    variable w
 
     # BOTTOM: Status Label
-    pack [ttk::label $f.status -text "Ready" -foreground blue] -fill x -pady {5 5}
+    set w(status) [ttk::label $w(root_frame).status -text "Ready" -foreground blue]
+    pack $w(status) -fill x -pady {5 5}
 
     # Fix Treeview row height to match font (prevents text clipping on Linux HiDPI)
     set font_name [ttk::style lookup Treeview -font]
     if {$font_name eq ""} { set font_name TkDefaultFont }
     set h [expr {[font metrics $font_name -linespace] + 6}]  ;# a bit of padding
     ttk::style configure Treeview -rowheight $h
+}
+
+# Consolidated status reporter: logs to console (as ::ui::status used
+# to) and, once the status widget exists, mirrors the message into it.
+proc ::ui::status {message {color blue}} {
+    variable w
+    puts "STATUS ($color): $message"  ;# Still log to console for debugging
+    if {[info exists w(status)] && [winfo exists $w(status)]} {
+        $w(status) configure -text $message -foreground $color
+    }
 }
 
 # ============================================================================
@@ -376,7 +429,6 @@ proc is_ignored {item_name} {
 
 proc load_tree_children {tree parent_item folder_id} {
     # Load children for a folder in the treeview (lazy loading)
-    global remote_entry
 
     debug_log "Loading tree children for folder ID: $folder_id"
 
@@ -391,7 +443,7 @@ proc load_tree_children {tree parent_item folder_id} {
     }
 
     # Get access token (any capability is fine for browsing)
-    set result [get_access_token [$remote_entry get] "" "detailed" 1]
+    set result [get_access_token [$::ui::w(remote_entry) get] "" "detailed" 1]
     set access_token [lindex $result 0]
 
     if {$access_token eq ""} {
@@ -479,20 +531,18 @@ proc load_tree_children {tree parent_item folder_id} {
 }
 
 proc gui_clear_acl_display {} {
-    global f acl_path_label action_buttons_frame
-
-    set acl_tree $f.paned.acl.tree.list
+    set acl_tree $::ui::w(acl)
     foreach item [$acl_tree children {}] {
         $acl_tree delete $item
     }
 
-    $acl_path_label configure -state normal
-    $acl_path_label delete 0 end
-    $acl_path_label insert 0 "(No ACL loaded - click Fetch ACL)"
-    $acl_path_label configure -state readonly
+    $::ui::w(item_entry) configure -state normal
+    $::ui::w(item_entry) delete 0 end
+    $::ui::w(item_entry) insert 0 "(No ACL loaded - click Fetch ACL)"
+    $::ui::w(item_entry) configure -state readonly
 
-    $action_buttons_frame.remove configure -state disabled
-    $action_buttons_frame.invite configure -state disabled
+    $::ui::w(btn_remove) configure -state disabled
+    $::ui::w(btn_invite) configure -state disabled
 
     debug_log "ACL display cleared"
 }
@@ -522,7 +572,7 @@ proc build_tree_path {tree item} {
 }
 
 proc on_tree_select {tree} {
-    global selected_item url_entry fetch_button f
+    global selected_item
 
     set selection [$tree selection]
     if {[llength $selection] == 0} {
@@ -554,13 +604,13 @@ proc on_tree_select {tree} {
     # Only update UI if selection actually changed
     if {$selection_changed} {
         # Update URL bar
-        $url_entry configure -state normal
-        $url_entry delete 0 end
-        $url_entry insert 0 "https://onedrive.live.com/?id=$item_id"
-        $url_entry configure -state readonly
+        $::ui::w(url_entry) configure -state normal
+        $::ui::w(url_entry) delete 0 end
+        $::ui::w(url_entry) insert 0 "https://onedrive.live.com/?id=$item_id"
+        $::ui::w(url_entry) configure -state readonly
 
         # Update Path bar with hierarchical path
-        set path_widget $f.input.path.entry
+        set path_widget $::ui::w(path_entry)
         set hierarchical_path [build_tree_path $tree $item]
         $path_widget configure -state normal
         $path_widget delete 0 end
@@ -571,7 +621,7 @@ proc on_tree_select {tree} {
         gui_clear_acl_display
 
         # Enable fetch button (user can now fetch ACL for this item)
-        $fetch_button configure -state normal
+        $::ui::w(fetch) configure -state normal
     }
 }
 
@@ -592,20 +642,20 @@ proc on_tree_expand {tree item} {
 
 proc on_fetch_button_click {} {
     # Fetch ACL for the currently selected item
-    global selected_item remote_entry
+    global selected_item
     
     if {[llength $selected_item] == 0} {
-        gui_update_status "No item selected" red
+        ::ui::status "No item selected" red
         return
     }
     
     if {![dict exists $selected_item id]} {
-        gui_update_status "Error: Invalid item selection" red
+        ::ui::status "Error: Invalid item selection" red
         return
     }
     
     set item_id [dict get $selected_item id]
-    set remote_name [$remote_entry get]
+    set remote_name [$::ui::w(remote_entry) get]
     
     # Fetch ACL using ID directly (no lookup needed)
     gui_fetch_acl $item_id $remote_name
@@ -1076,8 +1126,8 @@ proc oauth_modal_check_completion {modal_window start_time} {
                 set oauth(auth_code) ""
                 
                 # Update token capability
-                global token_capability remote_entry
-                set token_result [get_access_token [$remote_entry get] "" "detailed" 1]
+                global token_capability
+                set token_result [get_access_token [$::ui::w(remote_entry) get] "" "detailed" 1]
                 set token_capability [lindex $token_result 1]
                 # Ignore expires_at (3rd element) here
                 
@@ -1118,7 +1168,7 @@ proc oauth_modal_reload_token {modal_window reload_btn} {
     # Handle token reload from file with validation
     debug_log "oauth_modal_reload_token called with args: modal=$modal_window, reload_btn=$reload_btn"
     
-    global oauth remote_entry token_capability oauth_modal_result
+    global oauth token_capability oauth_modal_result
     if {[info exists oauth_modal_result]} {
         debug_log "oauth_modal_result exists, current value: $oauth_modal_result"
     } else {
@@ -1157,7 +1207,7 @@ proc oauth_modal_reload_token {modal_window reload_btn} {
     
     # Load and validate token
     if {[catch {
-        set token_result [get_access_token [$remote_entry get] "" "detailed" 1]
+        set token_result [get_access_token [$::ui::w(remote_entry) get] "" "detailed" 1]
         set access_token [lindex $token_result 0]
         set capability [lindex $token_result 1]
         # expires_at is 3rd element but not needed here
@@ -1297,10 +1347,10 @@ proc show_oauth_modal_dialog {} {
 proc ensure_edit_capability {} {
     # Check if we have edit capability, trigger OAuth flow if needed
     # Returns: 1 if we have edit capability, 0 if user cancelled or failed
-    global token_capability remote_entry
+    global token_capability
     
     # Get current token capability
-    set result [get_access_token [$remote_entry get] "" "detailed" 1]
+    set result [get_access_token [$::ui::w(remote_entry) get] "" "detailed" 1]
     set access_token [lindex $result 0]
     set capability [lindex $result 1]
     # expires_at is 3rd element but not needed here
@@ -1323,9 +1373,9 @@ proc ensure_edit_capability {} {
 
 proc on_invite_user_click {} {
     # Show dialog to invite a user
-    global current_item_id remote_entry f
-    set tree $f.paned.acl.tree.list
-    
+    global current_item_id
+    set tree $::ui::w(acl)
+
     if {$current_item_id eq ""} {
         tk_messageBox -type ok -icon warning -title "No Item Selected" \
             -message "Please fetch ACL for an item first."
@@ -1388,29 +1438,29 @@ proc on_invite_user_click {} {
         }
         
         # Get access token
-        set result [get_access_token [$remote_entry get] "" "detailed" 1]
+        set result [get_access_token [$::ui::w(remote_entry) get] "" "detailed" 1]
         set access_token [lindex $result 0]
         # capability is 2nd element, expires_at is 3rd (not needed here)
         
         if {$access_token eq ""} {
-            gui_update_status "Error: No access token available" red
+            ::ui::status "Error: No access token available" red
             return
         }
         
         # Invite user
-        gui_update_status "Inviting $email..." blue
+        ::ui::status "Inviting $email..." blue
         set invite_result [invite_user_to_item $current_item_id $email $role $access_token]
         set invite_status [lindex $invite_result 0]
         set invite_message [lindex $invite_result 1]
         
         if {$invite_status eq "ok"} {
-            gui_update_status "✅ $invite_message" green
+            ::ui::status "✅ $invite_message" green
             # Refresh ACL display
             after 1000 {refresh_current_acl}
         } elseif {$invite_status eq "error" && [string match "*401*" $invite_message]} {
-            gui_update_status "Token expired - please try again" red
+            ::ui::status "Token expired - please try again" red
         } else {
-            gui_update_status "❌ $invite_message" red
+            ::ui::status "❌ $invite_message" red
         }
     } else {
         destroy $dialog
@@ -1419,9 +1469,9 @@ proc on_invite_user_click {} {
 
 proc on_remove_selected_click {} {
     # Remove selected permissions from treeview
-    global f current_item_id remote_entry
-    set tree $f.paned.acl.tree.list
-    
+    global current_item_id
+    set tree $::ui::w(acl)
+
     if {$current_item_id eq ""} {
         tk_messageBox -type ok -icon warning -title "No Item Selected" \
             -message "Please fetch ACL for an item first."
@@ -1452,12 +1502,12 @@ proc on_remove_selected_click {} {
     }
     
     # Get access token
-    set result [get_access_token [$remote_entry get] "" "detailed" 1]
+    set result [get_access_token [$::ui::w(remote_entry) get] "" "detailed" 1]
     set access_token [lindex $result 0]
     # capability is 2nd element, expires_at is 3rd (not needed here)
     
     if {$access_token eq ""} {
-        gui_update_status "Error: No access token available" red
+        ::ui::status "Error: No access token available" red
         return
     }
     
@@ -1465,7 +1515,7 @@ proc on_remove_selected_click {} {
     set success_count 0
     set fail_count 0
     
-    gui_update_status "Removing $count permission(s)..." blue
+    ::ui::status "Removing $count permission(s)..." blue
     
     foreach item $selection {
         set values [$tree item $item -values]
@@ -1480,16 +1530,16 @@ proc on_remove_selected_click {} {
             incr fail_count
             set error_msg [lindex $remove_result 1]
             if {[string match "*401*" $error_msg]} {
-                gui_update_status "Token expired - please try again" red
+                ::ui::status "Token expired - please try again" red
                 return
             }
         }
     }
     
     if {$fail_count == 0} {
-        gui_update_status "✅ Removed $success_count permission(s)" green
+        ::ui::status "✅ Removed $success_count permission(s)" green
     } else {
-        gui_update_status "⚠️ Removed $success_count, failed $fail_count" orange
+        ::ui::status "⚠️ Removed $success_count, failed $fail_count" orange
     }
     
     # Refresh ACL display
@@ -1498,11 +1548,11 @@ proc on_remove_selected_click {} {
 
 proc refresh_current_acl {} {
     # Refresh the current ACL display
-    global selected_item remote_entry
+    global selected_item
     
     if {[dict exists $selected_item id]} {
         set item_id [dict get $selected_item id]
-        set remote_name [$remote_entry get]
+        set remote_name [$::ui::w(remote_entry) get]
         gui_fetch_acl $item_id $remote_name
     }
 }
@@ -2127,11 +2177,11 @@ proc scan_shared_folders_user_impl {item_id user_email max_depth item_type remot
 
 # GUI wrapper: Fetch ACL and update GUI widgets
 proc gui_fetch_acl {item_id remote_name} {
-    global f current_item_id token_capability action_buttons_frame acl_path_label
-    set acl_tree $f.paned.acl.tree.list
-    
+    global current_item_id token_capability
+    set acl_tree $::ui::w(acl)
+
     if {$item_id eq ""} {
-        gui_update_status "Error: Invalid item ID" red
+        ::ui::status "Error: Invalid item ID" red
         return
     }
     
@@ -2155,11 +2205,11 @@ proc gui_fetch_acl {item_id remote_name} {
         set exp_display ""
     }
     
-    gui_update_status "✅ Using token (capability: $capability)$exp_display" green
+    ::ui::status "✅ Using token (capability: $capability)$exp_display" green
     
     # Get item info by ID (no lookup needed - we already have ID)
     set item_url [build_graph_api_url "/me/drive/items/$item_id"]
-    gui_update_status "Getting item info for ID: $item_id" blue
+    ::ui::status "Getting item info for ID: $item_id" blue
     
     set result [make_http_request $item_url [list Authorization "Bearer $access_token"]]
     set status [lindex $result 0]
@@ -2168,19 +2218,19 @@ proc gui_fetch_acl {item_id remote_name} {
     if {$status ne "200"} {
         # Handle 401 errors specially - token might have expired
         if {$status eq "401" && $capability eq "full" && [string match "*TOKEN_EXPIRED*" $data]} {
-            gui_update_status "❌ Token expired despite refresh attempt. Please re-authenticate." red
+            ::ui::status "❌ Token expired despite refresh attempt. Please re-authenticate." red
             return
         } elseif {$status eq "error"} {
-            gui_update_status "❌ HTTP request failed: $data" red
+            ::ui::status "❌ HTTP request failed: $data" red
         } else {
-            gui_update_status "❌ Failed to get item info: $status - $data" red
+            ::ui::status "❌ Failed to get item info: $status - $data" red
         }
         return
     }
     
     # Parse item response
     if {[catch {json::json2dict $data} item_dict]} {
-        gui_update_status "❌ Failed to parse item response: $item_dict" red
+        ::ui::status "❌ Failed to parse item response: $item_dict" red
         return
     }
     
@@ -2191,48 +2241,36 @@ proc gui_fetch_acl {item_id remote_name} {
     set current_item_id $item_id
     
     # Update ACL path label with item name (no path lookup needed - GUI works with IDs only)
-    $acl_path_label configure -state normal
-    $acl_path_label delete 0 end
-    $acl_path_label insert 0 $item_name
-    $acl_path_label configure -state readonly
+    $::ui::w(item_entry) configure -state normal
+    $::ui::w(item_entry) delete 0 end
+    $::ui::w(item_entry) insert 0 $item_name
+    $::ui::w(item_entry) configure -state readonly
     
-    gui_update_status "✅ Found $item_type" green
+    ::ui::status "✅ Found $item_type" green
 
     foreach item [$acl_tree children {}] {
         $acl_tree delete $item
     }
-    gui_update_status "Treeview cleared" green
+    ::ui::status "Treeview cleared" green
 
-    gui_update_status "Getting ACL..." blue
+    ::ui::status "Getting ACL..." blue
     set perm_result [fetch_permissions_by_id $item_id $access_token]
     set perm_status [lindex $perm_result 0]
     set permissions [lindex $perm_result 1]
     
     if {$perm_status ne "ok"} {
-        gui_update_status "❌ $permissions" red
+        ::ui::status "❌ $permissions" red
         return
     }
     
     set perm_count [llength $permissions]
-    
-    # Bind treeview selection event to enable/disable Remove button
-    bind $acl_tree <<TreeviewSelect>> {
-        global f action_buttons_frame
-        set acl_tree $f.paned.acl.tree.list
-        set selection [$acl_tree selection]
-        if {[llength $selection] > 0} {
-            $action_buttons_frame.remove configure -state normal
-        } else {
-            $action_buttons_frame.remove configure -state disabled
-        }
-    }
-    
+
     if {$perm_count == 0} {
-        gui_update_status "ℹ️ No permissions found for this item (empty ACL)" orange
+        ::ui::status "ℹ️ No permissions found for this item (empty ACL)" orange
         return
     }
     
-    gui_update_status "✅ Found $perm_count permission(s) in ACL (Token: $capability)" green
+    ::ui::status "✅ Found $perm_count permission(s) in ACL (Token: $capability)" green
 
     # Sort permissions: non-inherited first, then inherited, each group sorted by email
     set sorted_permissions [lsort -command {
@@ -2308,9 +2346,9 @@ proc gui_fetch_acl {item_id remote_name} {
     }
     
     # Enable invite button now that ACL is loaded
-    $action_buttons_frame.invite configure -state normal
+    $::ui::w(btn_invite) configure -state normal
 
-    gui_update_status "✅ ACL listing of: https://onedrive.live.com/?id=$item_id" green
+    ::ui::status "✅ ACL listing of: https://onedrive.live.com/?id=$item_id" green
 }
 
 
@@ -2672,43 +2710,36 @@ proc main {argc argv} {
     }
 }
 
-if {[info commands tk] ne ""} {
+proc ::ui::start {} {
+    variable w
+
     # GUI MODE - Parse command line arguments
-    
+
     # Check for -debug flag in GUI mode
     global debug_mode argc argv
     if {[lsearch -exact $argv "-debug"] != -1} {
         set debug_mode 1
     }
 
-    # GUI MODE FUNCTIONS
-    
-    # GUI-specific status and treeview functions
-    proc gui_update_status {message color} {
-        global f
-        puts "STATUS ($color): $message"  ;# Still log to console for debugging
-        if {[info exists f] && [winfo exists $f.status]} {
-            $f.status configure -text $message -foreground $color
-        }
-    }
-    
-    # Update gui_fetch_acl to use GUI-specific functions
-    # (We'll replace all update_status/clear_treeview calls)
-    
     # GUI INITIALIZATION
-    
+    ::ui::build
+
     # GUI mode - Initialize browser with root folder
-    gui_update_status "OneDrive ACL Lister - Ready to browse and fetch ACL information" blue
+    ::ui::status "OneDrive ACL Lister - Ready to browse and fetch ACL information" blue
 
     # Load root folder contents and auto-expand root item
-    set root_item [lindex [$browser_tree children {}] 0]
-    load_tree_children $browser_tree $root_item "root"
-    $browser_tree item $root_item -open 1
+    set root_item [lindex [$w(tree) children {}] 0]
+    load_tree_children $w(tree) $root_item "root"
+    $w(tree) item $root_item -open 1
 
     # wish would enter the event loop on reaching the end of the script; a
     # tclsh has to be told. Waiting on the main window rather than a variable
     # that is never set means closing the browser ends the process.
     tkwait window .
+}
+
+if {[info commands tk] ne ""} {
+    ::ui::start
 } else {
     main $argc $argv
 }
