@@ -402,9 +402,9 @@ proc load_tree_children {tree parent_item folder_id} {
     # Fetch folder contents from OneDrive API
     set headers [list Authorization "Bearer $access_token"]
     if {$folder_id eq "root"} {
-        set children_url "https://graph.microsoft.com/v1.0/me/drive/root/children"
+        set children_url [build_graph_api_url "/me/drive/root/children"]
     } else {
-        set children_url "https://graph.microsoft.com/v1.0/me/drive/items/$folder_id/children"
+        set children_url [build_graph_api_url "/me/drive/items/$folder_id/children"]
     }
 
     set result [make_http_request $children_url $headers]

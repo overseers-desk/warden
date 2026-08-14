@@ -521,3 +521,192 @@ proc fetch_permissions_by_id {item_id access_token} {
     set permissions [dict get $permissions_dict value]
     return [list "ok" $permissions]
 }
+
+proc enforce_remove_emails {fid emails access_token} {
+    # Remove every permission naming one of the emails on this folder,
+    # trying in place first: Graph refuses deletion of inherited permissions
+    # (inheritedFrom must be null), but probing keeps the tool correct the
+    # day Microsoft lifts that rule.
+    # Returns {removed_emails blocked_emails}: blocked = still inherited here
+    lassign [get_folder_permissions $fid $access_token] status permissions
+    if {$status ne "ok"} {
+        return [list {} $emails]
+    }
+    set removed {}
+    set blocked {}
+    foreach email $emails {
+        set done 0
+        set seen 0
+        foreach perm $permissions {
+            if {[is_owner_permission $perm]} { continue }
+            set match 0
+            foreach user_info [extract_users_from_perm $perm] {
+                if {[string tolower [lindex $user_info 1]] eq $email} {
+                    set match 1
+                    break
+                }
+            }
+            if {!$match} { continue }
+            set seen 1
+            lassign [remove_permission $fid [dict get $perm id] $access_token] rstatus rmsg
+            if {$rstatus eq "ok"} {
+                set done 1
+            }
+        }
+        if {$done} {
+            lappend removed $email
+        } elseif {$seen} {
+            lappend blocked $email
+        }
+    }
+
+    # Deleting an inherited copy of a leaked permission reports success yet
+    # the entry survives (docs/PHANTOM-INHERITANCE-BUG.md, retest
+    # 2026-08-05), so success is only believed after a re-read
+    if {[llength $removed] > 0} {
+        after 1000
+        lassign [get_folder_permissions $fid $access_token] vstatus vperms
+        if {$vstatus eq "ok"} {
+            set still [extract_users_from_permissions $vperms]
+            set truly_removed {}
+            foreach email $removed {
+                if {[dict exists $still $email]} {
+                    lappend blocked $email
+                } else {
+                    lappend truly_removed $email
+                }
+            }
+            set removed $truly_removed
+        }
+    }
+    return [list $removed $blocked]
+}
+
+# ============================================================================
+# Provider interface
+# ============================================================================
+# The audit and enforcement code drives a drive through this dict of proc
+# names ({*}[dict get $provider verb] ctx ...), never through Graph calls
+# directly. ctx comes from connect and carries the token (and, in write
+# mode, the drive root id: the sever cycle moves folders there).
+
+proc onedrive_provider {} {
+    return [dict create \
+        name onedrive \
+        connect od_connect \
+        get_item od_get_item \
+        item_path od_item_path \
+        get_acl od_get_acl \
+        invite od_invite \
+        remove od_remove \
+        sever od_sever \
+        capabilities [dict create roles {read write} sever 1]]
+}
+
+proc od_connect {remote mode} {
+    # Returns a ctx dict, or "" when no usable token exists. mode read
+    # accepts any token; mode write demands full capability and resolves
+    # the drive root id.
+    if {$mode eq "write"} {
+        set token [cli_get_full_token $remote]
+        if {$token eq ""} { return "" }
+        set root_result [cli_path_to_item_id_and_dict "/" $token]
+        if {[llength $root_result] == 0} { return "" }
+        return [dict create token $token remote $remote root_id [lindex $root_result 0]]
+    }
+    set result [get_access_token $remote "" "detailed" 1]
+    set token [lindex $result 0]
+    if {$token eq ""} { return "" }
+    return [dict create token $token remote $remote]
+}
+
+proc od_get_item {ctx fid} {
+    return [get_item_by_id $fid [dict get $ctx token]]
+}
+
+proc od_item_path {ctx item_dict} {
+    return [item_actual_path $item_dict]
+}
+
+proc od_get_acl {ctx fid} {
+    # {status acl}: acl holds email -> role dicts for direct, inherited,
+    # and all non-owner permissions. links stays empty here: OneDrive link
+    # shares surface as permission entries already.
+    lassign [get_folder_permissions $fid [dict get $ctx token]] status permissions
+    if {$status ne "ok"} { return [list $status {}] }
+    set direct_perms {}
+    set inherited_perms {}
+    foreach perm $permissions {
+        if {[is_owner_permission $perm]} { continue }
+        if {[is_inherited_permission $perm]} {
+            lappend inherited_perms $perm
+        } else {
+            lappend direct_perms $perm
+        }
+    }
+    return [list ok [dict create \
+        direct [extract_users_from_permissions $direct_perms] \
+        inherited [extract_users_from_permissions $inherited_perms] \
+        all [extract_users_from_permissions $permissions] \
+        links {}]]
+}
+
+proc od_invite {ctx fid email role} {
+    return [invite_user_to_item $fid $email $role [dict get $ctx token] 1]
+}
+
+proc od_remove {ctx fid emails} {
+    return [enforce_remove_emails $fid $emails [dict get $ctx token]]
+}
+
+proc od_sever {ctx fid fentry item_dict blocked} {
+    # Inherited permissions resist in-place deletion. At the drive root
+    # they detach entirely, and a folder returned to a shared tree
+    # re-attaches to the parent's inheritance unless it carries its own
+    # permission scope. So: move out, delete whatever explicit residue
+    # names the blocked users, plant the folder's full effective ACL as
+    # explicit permissions, and only then move back.
+    # Returns {status changed}, status ok | error; changed once the move
+    # has happened, whatever came after.
+    set token [dict get $ctx token]
+    puts "  🚚 inherited permissions on [join $blocked {, }]: moving folder to root to sever inheritance"
+    if {![dict exists $item_dict parentReference id]} {
+        return [list error 0]
+    }
+    set original_parent [dict get $item_dict parentReference id]
+    lassign [move_item $fid [dict get $ctx root_id] $token] mstatus mmsg
+    if {$mstatus ne "ok"} {
+        puts "  ❌ move failed: $mmsg"
+        return [list error 0]
+    }
+    after 2000
+    lassign [enforce_remove_emails $fid $blocked $token] removed2 blocked2
+    foreach email $removed2 { puts "  ✂️  removed $email (after move)" }
+    foreach email $blocked2 { puts "  ❌ still cannot remove $email" }
+
+    lassign [get_folder_permissions $fid $token] pstatus perms_now
+    if {$pstatus ne "ok"} {
+        puts "  ❌ cannot read permissions at root; leaving folder in place"
+    } else {
+        set live_now [extract_users_from_permissions $perms_now]
+        dict for {email role} [dict get $fentry effective] {
+            if {[dict exists $live_now $email] && \
+                ([dict get $live_now $email] eq $role || [dict get $live_now $email] eq "write")} { continue }
+            lassign [invite_user_to_item $fid $email $role $token 1] istatus imsg
+            if {$istatus eq "ok"} {
+                puts "  🌱 planted $email ($role)"
+            } elseif {$istatus eq "ok-notified"} {
+                puts "  🌱 planted $email ($role); ⚠️ notification email was sent"
+            } else {
+                puts "  ❌ plant $email failed: $imsg"
+            }
+        }
+    }
+    lassign [move_item $fid $original_parent $token] mstatus mmsg
+    if {$mstatus ne "ok"} {
+        puts "  ❌ MOVE BACK FAILED: $mmsg  (folder is sitting at the drive root)"
+        return [list error 1]
+    }
+    after 2000
+    return [list ok 1]
+}
