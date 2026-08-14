@@ -127,7 +127,7 @@ proc ::ui::build {} {
     package require Ttk
 
     # Create main window
-    wm title . "OneDrive ACL Lister"
+    wm title . "Cloud ACL Manager"
 
     # Handle window close during OAuth flow
     wm protocol . WM_DELETE_WINDOW {
@@ -154,6 +154,7 @@ proc ::ui::build {} {
     set w(root_frame) [ttk::frame .main]
     pack $w(root_frame) -fill both -expand yes -padx 10 -pady 10
 
+    ::ui::build_chrome
     ::ui::build_addressbar
 
     # MAIN CONTENT: Left-Right Split Layout
@@ -165,6 +166,107 @@ proc ::ui::build {} {
     ::ui::build_browser
     ::ui::build_acl_pane
     ::ui::build_status
+}
+
+proc ::ui::connections_discover {} {
+    # Drives this machine's rclone knows: one connection per onedrive or
+    # dropbox remote in rclone.conf.
+    variable state
+    set state(connections) {}
+    if {[info exists ::env(APPDATA)]} {
+        set conf [file join $::env(APPDATA) rclone rclone.conf]
+    } else {
+        set conf [file join $::env(HOME) .config rclone rclone.conf]
+    }
+    if {![file exists $conf]} { return }
+    set f [open $conf r]
+    set data [read $f]
+    close $f
+    set section ""
+    foreach line [split $data \n] {
+        set line [string trim $line]
+        if {[regexp {^\[(.+)\]$} $line -> name]} { set section $name; continue }
+        if {[regexp {^type\s*=\s*(\S+)} $line -> rtype] && $section ne ""} {
+            switch -- $rtype {
+                onedrive - dropbox {
+                    set pretty [expr {$rtype eq "onedrive" ? "OneDrive" : "Dropbox"}]
+                    lappend state(connections) [dict create \
+                        platform $rtype remote $section label "$pretty — $section"]
+                }
+            }
+        }
+    }
+}
+
+proc ::ui::build_chrome {} {
+    # Top strip: connected drives and the policy file in charge.
+    variable w
+    variable state
+    set f $w(root_frame)
+    pack [ttk::frame $f.chrome] -fill x -pady {0 6}
+    pack [ttk::label $f.chrome.conn -text "Connected:"] -side left
+    foreach conn $state(connections) {
+        set chip [string map {" " _ . _} [dict get $conn remote]]
+        pack [ttk::label $f.chrome.chip_$chip \
+            -text "● [dict get $conn label]" -foreground darkgreen \
+            -relief solid -borderwidth 1 -padding {4 1}] -side left -padx 3
+    }
+    pack [ttk::button $f.chrome.reload -text "Reload" -command ::ui::policy_reload] -side right -padx {4 0}
+    pack [ttk::button $f.chrome.open -text "Open…" -command ::ui::policy_open] -side right -padx {4 0}
+    set w(policy_label) [ttk::label $f.chrome.policy -text "(no policy loaded)" -foreground gray40]
+    pack $w(policy_label) -side right -padx {4 0}
+    pack [ttk::label $f.chrome.plabel -text "Policy:"] -side right -padx {10 0}
+}
+
+proc ::ui::policy_conf_file {} {
+    return [file join $::env(HOME) .config acl-manager gui-policy-path]
+}
+
+proc ::ui::policy_open {{path ""}} {
+    # Load a policy file into the session model; remember it for next launch.
+    variable state
+    variable w
+    if {$path eq ""} {
+        set path [tk_getOpenFile -title "Open policy file" \
+            -filetypes {{{YAML policy} {.yaml .yml}} {{All files} *}}]
+        if {$path eq ""} { return }
+    }
+    if {[catch {policy_load_v2 $path} model]} {
+        ::ui::status "Policy error: $model" red
+        return
+    }
+    set state(policy_path) $path
+    set state(model) $model
+    catch {
+        file mkdir [file dirname [::ui::policy_conf_file]]
+        set pf [open [::ui::policy_conf_file] w]
+        puts $pf $path
+        close $pf
+    }
+    $w(policy_label) configure -text $path -foreground black
+    set nwarn [llength [dict get $model warnings]]
+    set summary "Policy: [file tail $path] loaded"
+    if {$nwarn > 0} { append summary " ($nwarn unreachable grant(s))" }
+    ::ui::status $summary blue
+}
+
+proc ::ui::policy_reload {} {
+    variable state
+    if {[info exists state(policy_path)] && $state(policy_path) ne ""} {
+        ::ui::policy_open $state(policy_path)
+    } else {
+        ::ui::policy_open
+    }
+}
+
+proc ::ui::policy_startup {} {
+    # Reopen the policy used last time, when it still exists.
+    catch {
+        set pf [open [::ui::policy_conf_file] r]
+        set path [string trim [read $pf]]
+        close $pf
+        if {$path ne "" && [file exists $path]} { ::ui::policy_open $path }
+    }
 }
 
 proc ::ui::build_addressbar {} {
@@ -211,7 +313,7 @@ proc ::ui::build_browser {} {
     set left_frame [ttk::frame $w(paned).browser]
     $w(paned) add $left_frame -weight 1
 
-    ttk::label $left_frame.label -text "Browse OneDrive:"
+    ttk::label $left_frame.label -text "Folders:"
     pack $left_frame.label -anchor w -pady {0 5}
 
     # Create treeview with scrollbars
@@ -219,7 +321,7 @@ proc ::ui::build_browser {} {
     pack [ttk::scrollbar $left_frame.vscroll -orient vertical -command "$left_frame.tree yview"] -side right -fill y
 
     set w(tree) [ttk::treeview $left_frame.tree \
-        -columns {item_id type loaded} -show tree \
+        -columns {item_id type loaded provider} -show tree \
         -selectmode browse \
         -yscrollcommand "$left_frame.vscroll set" \
         -xscrollcommand "$left_frame.hscroll set"]
@@ -229,6 +331,7 @@ proc ::ui::build_browser {} {
     $w(tree) column item_id -width 0 -stretch 0
     $w(tree) column type -width 0 -stretch 0
     $w(tree) column loaded -width 0 -stretch 0
+    $w(tree) column provider -width 0 -stretch 0
 
     # Bind events for selection and expansion
     bind $w(tree) <<TreeviewSelect>> {on_tree_select $::ui::w(tree)}
@@ -252,9 +355,18 @@ proc ::ui::build_browser {} {
         }
     }
 
-    # Insert root item with dummy child to show expand arrow
-    set root_item [$w(tree) insert {} end -text "OneDrive Root" -values [list "root" "folder" 0]]
-    $w(tree) insert $root_item end -text ""  ;# Dummy child for expand arrow
+    # One root per connected drive, each with a dummy child for the arrow
+    variable state
+    if {[llength $state(connections)] == 0} {
+        set state(connections) [list [dict create \
+            platform onedrive remote OneDrive label "OneDrive"]]
+    }
+    foreach conn $state(connections) {
+        set root_id [expr {[dict get $conn platform] eq "onedrive" ? "root" : ""}]
+        set root_item [$w(tree) insert {} end -text [dict get $conn label] \
+            -values [list $root_id "folder" 0 [dict get $conn platform]]]
+        $w(tree) insert $root_item end -text ""
+    }
 }
 
 proc ::ui::build_acl_pane {} {
@@ -427,107 +539,124 @@ proc is_ignored {item_name} {
 # Treeview Browser Functions
 # ============================================================================
 
-proc load_tree_children {tree parent_item folder_id} {
-    # Load children for a folder in the treeview (lazy loading)
-
-    debug_log "Loading tree children for folder ID: $folder_id"
-
-    # Check if already loaded
-    if {$parent_item ne ""} {
-        set values [$tree item $parent_item -values]
-        set loaded [lindex $values 2]
-        if {$loaded} {
-            debug_log "Folder already loaded, skipping"
-            return
-        }
-    }
-
-    # Get access token (any capability is fine for browsing)
-    set result [get_access_token [$::ui::w(remote_entry) get] "" "detailed" 1]
-    set access_token [lindex $result 0]
-
-    if {$access_token eq ""} {
-        debug_log "No access token available"
+proc load_tree_children {tree parent_item} {
+    # Lazy loading; a node's hidden values are {item_id type loaded provider}
+    set values [$tree item $parent_item -values]
+    lassign $values folder_id type loaded provider
+    if {$loaded} {
+        debug_log "Folder already loaded, skipping"
         return
     }
+    debug_log "Loading tree children: provider=$provider id=$folder_id"
 
-    # Fetch folder contents from OneDrive API
+    switch -- $provider {
+        onedrive { set entries [children_onedrive $folder_id] }
+        dropbox  { set entries [children_dropbox $folder_id] }
+        default  { return }
+    }
+    if {$entries eq "ERROR"} { return }
+
+    foreach child [$tree children $parent_item] {
+        $tree delete $child
+    }
+
+    set folders {}
+    set files {}
+    foreach e $entries {
+        if {[is_ignored [dict get $e name]]} { continue }
+        if {[dict get $e is_folder]} {
+            lappend folders $e
+        } else {
+            lappend files $e
+        }
+    }
+    foreach e $folders {
+        set folder_item [$tree insert $parent_item end \
+            -text [dict get $e name] \
+            -values [list [dict get $e id] "folder" 0 $provider]]
+        $tree insert $folder_item end -text ""
+    }
+    foreach e $files {
+        $tree insert $parent_item end \
+            -text [dict get $e name] \
+            -values [list [dict get $e id] "file" 1 $provider]
+    }
+    $tree item $parent_item -values [list $folder_id $type 1 $provider]
+    debug_log "Tree children loaded: [llength $folders] folders, [llength $files] files"
+}
+
+proc children_onedrive {folder_id} {
+    # Children of a OneDrive folder as {name id is_folder} dicts, or ERROR
+    set result [get_access_token [$::ui::w(remote_entry) get] "" "detailed" 1]
+    set access_token [lindex $result 0]
+    if {$access_token eq ""} {
+        debug_log "No access token available"
+        return ERROR
+    }
     set headers [list Authorization "Bearer $access_token"]
     if {$folder_id eq "root"} {
         set children_url [build_graph_api_url "/me/drive/root/children"]
     } else {
         set children_url [build_graph_api_url "/me/drive/items/$folder_id/children"]
     }
-
-    set result [make_http_request $children_url $headers]
-    set status [lindex $result 0]
-    set data [lindex $result 1]
-
-    if {$status eq "200"} {
-        # Remove dummy child if parent exists
-        if {$parent_item ne ""} {
-            foreach child [$tree children $parent_item] {
-                $tree delete $child
-            }
-        }
-
-        set children_dict [json::json2dict $data]
-        set children [dict get $children_dict value]
-
-        # Sort: folders first, then files
-        set folders {}
-        set files {}
-
-        foreach child $children {
-            set child_name [dict get $child name]
-            
-            # Skip ignored items
-            if {[is_ignored $child_name]} {
-                continue
-            }
-            
-            set child_id [dict get $child id]
-            set is_folder [dict exists $child folder]
-
-            if {$is_folder} {
-                lappend folders [dict create name $child_name id $child_id]
-            } else {
-                lappend files [dict create name $child_name id $child_id]
-            }
-        }
-
-        # Insert folders with dummy children
-        foreach item $folders {
-            set name [dict get $item name]
-            set item_id [dict get $item id]
-            set folder_item [$tree insert $parent_item end \
-                -text $name \
-                -values [list $item_id "folder" 0]]
-            # Insert dummy child to show expand arrow
-            $tree insert $folder_item end -text ""
-        }
-
-        # Insert files (no children)
-        foreach item $files {
-            set name [dict get $item name]
-            set item_id [dict get $item id]
-            $tree insert $parent_item end \
-                -text $name \
-                -values [list $item_id "file" 1]
-        }
-
-        # Mark parent as loaded
-        if {$parent_item ne ""} {
-            set values [$tree item $parent_item -values]
-            set item_id [lindex $values 0]
-            set type [lindex $values 1]
-            $tree item $parent_item -values [list $item_id $type 1]
-        }
-
-        debug_log "Tree children loaded: [llength $folders] folders, [llength $files] files"
-    } else {
+    lassign [make_http_request $children_url $headers] status data
+    if {$status ne "200"} {
         debug_log "Error loading tree children: status $status"
+        return ERROR
     }
+    set entries {}
+    foreach child [dict get [json::json2dict $data] value] {
+        lappend entries [dict create \
+            name [dict get $child name] \
+            id [dict get $child id] \
+            is_folder [dict exists $child folder]]
+    }
+    return $entries
+}
+
+proc children_dropbox {folder_id} {
+    # Children of a Dropbox folder ("" is the root) as {name id is_folder}
+    set ctx [::ui::dropbox_ctx]
+    if {$ctx eq ""} { return ERROR }
+    if {[catch {dbx_call [dict get $ctx token] /2/files/list_folder \
+            [::json::write::object path [::json::write::string $folder_id] limit 500]} resp]} {
+        debug_log "Dropbox list_folder failed: $resp"
+        ::ui::status "Dropbox listing failed" red
+        return ERROR
+    }
+    set entries {}
+    while {1} {
+        foreach e [dict get $resp entries] {
+            lappend entries [dict create \
+                name [dict get $e name] \
+                id [dict get $e id] \
+                is_folder [expr {[dict get $e .tag] eq "folder"}]]
+        }
+        if {[dict exists $resp has_more] && [dict get $resp has_more]} {
+            if {[catch {dbx_call [dict get $ctx token] /2/files/list_folder/continue \
+                    [::json::write::object cursor [::json::write::string [dict get $resp cursor]]]} resp]} {
+                break
+            }
+        } else break
+    }
+    return $entries
+}
+
+proc ::ui::dropbox_ctx {} {
+    # One Dropbox connection per session, made on first use
+    variable state
+    if {[info exists state(dbx_ctx)] && $state(dbx_ctx) ne ""} {
+        return $state(dbx_ctx)
+    }
+    set remote [platform_remote dropbox ""]
+    foreach conn $state(connections) {
+        if {[dict get $conn platform] eq "dropbox"} {
+            set remote [dict get $conn remote]
+            break
+        }
+    }
+    set state(dbx_ctx) [dbx_connect $remote read]
+    return $state(dbx_ctx)
 }
 
 proc gui_clear_acl_display {} {
@@ -584,7 +713,10 @@ proc on_tree_select {tree} {
 
     set item_id [lindex $values 0]
     set type [lindex $values 1]
+    set provider [lindex $values 3]
+    if {$provider eq ""} { set provider onedrive }
     set is_folder [expr {$type eq "folder"}]
+    set ::ui::state(sel_provider) $provider
 
     # Check if selection actually changed
     set selection_changed 0
@@ -597,16 +729,22 @@ proc on_tree_select {tree} {
     # Update selected item (simplified structure)
     set selected_item [dict create \
         id $item_id \
-        is_folder $is_folder]
+        is_folder $is_folder \
+        provider $provider]
 
     debug_log "Item selected: ID=$item_id, is_folder=$is_folder, selection_changed=$selection_changed"
 
     # Only update UI if selection actually changed
     if {$selection_changed} {
         # Update URL bar
+        if {$provider eq "dropbox"} {
+            set url "https://www.dropbox.com/home"
+        } else {
+            set url "https://onedrive.live.com/?id=$item_id"
+        }
         $::ui::w(url_entry) configure -state normal
         $::ui::w(url_entry) delete 0 end
-        $::ui::w(url_entry) insert 0 "https://onedrive.live.com/?id=$item_id"
+        $::ui::w(url_entry) insert 0 $url
         $::ui::w(url_entry) configure -state readonly
 
         # Update Path bar with hierarchical path
@@ -636,7 +774,7 @@ proc on_tree_expand {tree item} {
 
     # Only load if folder and not yet loaded
     if {$type eq "folder" && !$loaded} {
-        load_tree_children $tree $item $item_id
+        load_tree_children $tree $item
     }
 }
 
@@ -655,8 +793,12 @@ proc on_fetch_button_click {} {
     }
     
     set item_id [dict get $selected_item id]
+    if {[dict exists $selected_item provider] && [dict get $selected_item provider] eq "dropbox"} {
+        gui_fetch_acl_dropbox $item_id
+        return
+    }
     set remote_name [$::ui::w(remote_entry) get]
-    
+
     # Fetch ACL using ID directly (no lookup needed)
     gui_fetch_acl $item_id $remote_name
 }
@@ -1372,6 +1514,10 @@ proc ensure_edit_capability {} {
 }
 
 proc on_invite_user_click {} {
+    if {[info exists ::ui::state(sel_provider)] && $::ui::state(sel_provider) eq "dropbox"} {
+        ::ui::status "Inviting on Dropbox is done through policy enforcement for now" orange
+        return
+    }
     # Show dialog to invite a user
     global current_item_id
     set tree $::ui::w(acl)
@@ -1468,6 +1614,10 @@ proc on_invite_user_click {} {
 }
 
 proc on_remove_selected_click {} {
+    if {[info exists ::ui::state(sel_provider)] && $::ui::state(sel_provider) eq "dropbox"} {
+        ::ui::status "Removing on Dropbox is done through policy enforcement for now" orange
+        return
+    }
     # Remove selected permissions from treeview
     global current_item_id
     set tree $::ui::w(acl)
@@ -2176,6 +2326,63 @@ proc scan_shared_folders_user_impl {item_id user_email max_depth item_type remot
 # Returns: {status permissions} where status is "ok" or error message
 
 # GUI wrapper: Fetch ACL and update GUI widgets
+proc gui_fetch_acl_dropbox {fid} {
+    # Fill the ACL table from the Dropbox provider's normalized view:
+    # members split direct/inherited, then any shared links as rows of
+    # their own. Rows are display-only; removal works through enforcement.
+    set ctx [::ui::dropbox_ctx]
+    if {$ctx eq ""} {
+        ::ui::status "No Dropbox connection" red
+        return
+    }
+    ::ui::status "Fetching Dropbox ACL..." blue
+    update
+    lassign [dbx_get_item $ctx $fid] istatus item
+    if {$istatus ne "ok"} {
+        ::ui::status "Cannot resolve the Dropbox folder" red
+        return
+    }
+    set path [dbx_item_path $ctx $item]
+    lassign [dbx_get_acl $ctx $fid] astatus acl
+    if {$astatus ne "ok"} {
+        ::ui::status "Cannot read Dropbox members" red
+        return
+    }
+
+    set acl_tree $::ui::w(acl)
+    foreach row [$acl_tree children {}] { $acl_tree delete $row }
+    $::ui::w(item_entry) configure -state normal
+    $::ui::w(item_entry) delete 0 end
+    $::ui::w(item_entry) insert 0 $path
+    $::ui::w(item_entry) configure -state readonly
+
+    set model ""
+    if {[info exists ::ui::state(model)]} { set model $::ui::state(model) }
+    set rows 0
+    foreach {source inherited_str} {direct No inherited Yes} {
+        foreach email [lsort [dict keys [dict get $acl $source]]] {
+            set role [dict get $acl $source $email]
+            set who ""
+            if {$model ne ""} {
+                set who [identity_display $model [identity_person_for $model dropbox $email]]
+            }
+            set tags [list $role]
+            if {$source eq "inherited"} { lappend tags inherited }
+            $acl_tree insert {} end -text $email \
+                -values [list $who $role $inherited_str "" "" "" ""] \
+                -tags $tags
+            incr rows
+        }
+    }
+    foreach link [dict get $acl links] {
+        $acl_tree insert {} end -text "(shared link)" \
+            -values [list "anyone with the URL" read No link "" "" ""] \
+            -tags read
+        incr rows
+    }
+    ::ui::status "Dropbox ACL: $rows entr(ies) on $path" blue
+}
+
 proc gui_fetch_acl {item_id remote_name} {
     global current_item_id token_capability
     set acl_tree $::ui::w(acl)
@@ -2722,15 +2929,24 @@ proc ::ui::start {} {
     }
 
     # GUI INITIALIZATION
+    ::ui::connections_discover
     ::ui::build
+    ::ui::policy_startup
 
-    # GUI mode - Initialize browser with root folder
-    ::ui::status "OneDrive ACL Lister - Ready to browse and fetch ACL information" blue
+    ::ui::status "Cloud ACL Manager - expand a drive to browse" blue
 
-    # Load root folder contents and auto-expand root item
+    # Open the first drive's root so the window is not empty
     set root_item [lindex [$w(tree) children {}] 0]
-    load_tree_children $w(tree) $root_item "root"
-    $w(tree) item $root_item -open 1
+    if {$root_item ne ""} {
+        load_tree_children $w(tree) $root_item
+        $w(tree) item $root_item -open 1
+    }
+
+    # Test seam: a script named in ACL_GUI_SCRIPT runs inside the live GUI
+    # once it is up, so the walkthrough can drive real handlers headlessly.
+    if {[info exists ::env(ACL_GUI_SCRIPT)] && [file exists $::env(ACL_GUI_SCRIPT)]} {
+        after 1200 [list source $::env(ACL_GUI_SCRIPT)]
+    }
 
     # wish would enter the event loop on reaching the end of the script; a
     # tclsh has to be told. Waiting on the main window rather than a variable
