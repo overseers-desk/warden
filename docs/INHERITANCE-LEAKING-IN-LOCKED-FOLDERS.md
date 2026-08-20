@@ -60,9 +60,9 @@ When an **existing user's role is changed** at the parent level (e.g., write →
 
 ### Observed Evidence
 
-**Setup:** `tom.jose.sunil@gmail.com` had **write** access at the root entity folder. He was **not present** in either locked subfolder:
-- 🔒 Board Reports and Meetings — 6 users, sunil NOT listed
-- 🔒 Contracts, Payroll, Super, and PAYG — 5 users, sunil NOT listed
+**Setup:** `contractor@example.com` had **write** access at the root entity folder. He was **not present** in either locked subfolder:
+- 🔒 Board Reports and Meetings — 6 users, the contractor NOT listed
+- 🔒 Contracts, Payroll, Super, and PAYG — 5 users, the contractor NOT listed
 
 **Action:** Changed sunil from **write → read** at the root entity level.
 

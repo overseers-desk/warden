@@ -11,7 +11,7 @@ When attempting to remove a user's permission from a child folder using `--remov
 
 ### Example
 ```bash
-./warden.tcl --remove-user john_2217@icloud.com \
+./warden.tcl --remove-user outsider@example.com \
   "🇦🇺 Colourful.land Pty Ltd/👷 Human Resources/🔒 Contracts, Payroll, Super, and PAYG"
 ```
 
