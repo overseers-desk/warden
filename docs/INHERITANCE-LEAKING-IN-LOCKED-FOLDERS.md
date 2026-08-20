@@ -34,7 +34,7 @@ Every time a new user is added at the top level, **all locked subfolders must be
 3. Re-plant the folder's desired ACL as explicit permissions while it sits at the root (a folder returned to a shared tree without its own permission scope re-inherits the parent's set wholesale; see PHANTOM-INHERITANCE-BUG.md, retest 2026-08-05)
 4. Move folder back to original location
 
-`acl-manager.tcl --enforce` performs this cycle automatically for policy folders.
+`warden.tcl --enforce` performs this cycle automatically for policy folders.
 
 ### Example
 
@@ -115,20 +115,20 @@ When a parent-level change causes leaking, each affected locked folder must be i
 rclone moveto "OneDrive:Parent/🔒 Locked Folder" "OneDrive:🔒 Locked Folder"
 
 # 2. Remove leaked user(s)
-tclsh acl-manager.tcl --remove-user leaked@example.com "🔒 Locked Folder"
+tclsh warden.tcl --remove-user leaked@example.com "🔒 Locked Folder"
 
 # 3. Move back
 rclone moveto "OneDrive:🔒 Locked Folder" "OneDrive:Parent/🔒 Locked Folder"
 
 # 4. Verify
-tclsh acl-manager.tcl "Parent/🔒 Locked Folder"
+tclsh warden.tcl "Parent/🔒 Locked Folder"
 ```
 
 ### Prevention
 
 There is no way to prevent leaking in OneDrive Personal. The only mitigation strategies are:
 
-1. **Audit after every parent change** — Run `acl-manager.tcl -r` on parent folders after any permission modification to detect leaks
+1. **Audit after every parent change** — Run `warden.tcl -r` on parent folders after any permission modification to detect leaks
 2. **Minimize parent-level changes** — Add users at the most specific folder level possible, not at the top
 3. **Accept and remediate** — Treat locked folders as requiring periodic maintenance after any parent ACL change
 

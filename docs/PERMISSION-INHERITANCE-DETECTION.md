@@ -268,7 +268,7 @@ proc is_owner_permission {perm} {
 
 ## Tool Implementation
 
-The acl-manager tool uses `is_inherited_permission` (line 624) and `has_explicit_user_permission` (line 2660) to:
+The warden tool uses `is_inherited_permission` (line 624) and `has_explicit_user_permission` (line 2660) to:
 
 1. Skip inherited permissions when removing users (Graph API limitation)
 2. Filter results to show only explicit/unique permissions

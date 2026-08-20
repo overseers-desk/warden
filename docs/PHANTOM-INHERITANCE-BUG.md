@@ -11,7 +11,7 @@ When attempting to remove a user's permission from a child folder using `--remov
 
 ### Example
 ```bash
-./acl-manager.tcl --remove-user john_2217@icloud.com \
+./warden.tcl --remove-user john_2217@icloud.com \
   "🇦🇺 Colourful.land Pty Ltd/👷 Human Resources/🔒 Contracts, Payroll, Super, and PAYG"
 ```
 
@@ -34,7 +34,7 @@ Result: Tool reports "does not have explicit access" but user still has access t
    - Re-adding permission to parent: **Re-appears on child as inherited**
 
 3. **Microsoft Graph API limitation**
-   - API prohibits deletion of inherited permissions (acl-manager.tcl:2668)
+   - API prohibits deletion of inherited permissions (warden.tcl:2668)
    - Documentation states: "Only sharing permissions that are not inherited can be deleted. The inheritedFrom property must be null."
    - Phantom inherited permissions cannot be removed through normal API calls
 
@@ -199,7 +199,7 @@ Note: `inheritedFrom` field is absent, making permission deletable.
 
 ### Why `has_explicit_user_permission` Skips These
 
-File: `acl-manager.tcl:2660-2681`
+File: `warden.tcl:2660-2681`
 
 ```tcl
 proc has_explicit_user_permission {permissions target_user_lower} {
@@ -233,10 +233,10 @@ The tool **correctly implements** Microsoft's Graph API specification which stat
 
 ```bash
 # Check if user has access
-./acl-manager.tcl --only-user user@example.com "Path/To/Folder"
+./warden.tcl --only-user user@example.com "Path/To/Folder"
 
 # Try to remove (will fail if phantom inheritance)
-./acl-manager.tcl --remove-user user@example.com "Path/To/Folder"
+./warden.tcl --remove-user user@example.com "Path/To/Folder"
 ```
 
 If you see "does not have explicit access" but user shows up in folder ACL, you have phantom inheritance.

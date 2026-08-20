@@ -18,7 +18,7 @@
 const BAR_ID = "odpath-bar";
 
 // --- URL / id parsing (shares the rules of convert_onedrive_url_to_path in
-//     acl-manager.tcl) -------------------------------------------------------
+//     warden.tcl) -------------------------------------------------------
 
 function getDecodedId() {
   const m = location.href.match(/[?&]id=([^&]*)/);

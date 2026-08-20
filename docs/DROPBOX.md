@@ -1,6 +1,6 @@
 # Rules: working with the Dropbox sharing API
 
-These rules summarise behaviour observed while writing and using `dropbox-acl-manager.tcl`. Read them before adding any sharing-API code path. The recurring failure mode in this codebase has been treating the API surface as if it matched its semantics; most of these rules are points where the surface lies.
+These rules summarise behaviour observed while writing and using `warden-dropbox.tcl`. Read them before adding any sharing-API code path. The recurring failure mode in this codebase has been treating the API surface as if it matched its semantics; most of these rules are points where the surface lies.
 
 ## unshare_folder is async; poll check_job_status
 
