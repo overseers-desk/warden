@@ -1,201 +1,152 @@
-# Cloud ACL Manager
+# Warden: the people you shared with are still in there
 
-A drive tells you who can access a folder, but only the one you're looking at, not the subfolders beneath it. Someone you shared a subfolder with years ago may still have access, and you won't know unless you open every folder by hand. Cloud ACL Manager audits OneDrive and Dropbox against one policy file that names your people once, whatever address each drive knows them by, and it can fix what drifted.
+Consumer OneDrive and Dropbox Basic let you share a folder with a person, and that is the whole of what they offer. There is no role you can hand someone. There is no group you can put people into. There is no screen anywhere that lists everyone who can currently reach anything. The bookkeeper you added to Finance three years ago is still in Finance, and you will not discover that by looking, because looking means opening every folder in turn and reading a sharing panel that describes only the folder you are standing in.
 
-## What it does
+Warden supplies the missing layer. You write one policy file naming your people, the groups they belong to, the folder collections those groups may reach, and at what role. Warden reads the live sharing state of your drives, compares it against that policy, and reports every place where the drives disagree with what you wrote. On request it repairs the difference.
 
-- Audit both drives against one policy (people, groups, folder collections, grants) and enforce it, with a dry-run preview
-- Recursive ACL scan of a folder tree, with smart pruning of inherited permissions
-- Find everything a given user can access across a tree
-- Remove a user's access across a tree, with a dry-run preview
-- Invite a user to a folder, inherited by its children (optionally written into the policy in the same act)
-- Scan folders, files, or both
-- Reads tokens from rclone's config (both remotes) and its own `token.json` for elevated OneDrive work
+Warden is a Tcl/Tk program with a browser and a command line. Both work from the same policy file and produce the same findings.
 
-Two interfaces: a Tcl/Tk browser with Access, Policy, People, and Audit tabs over both drives, and a command line with the full set of operations, including the recursive scans and scheduled audits.
+## Situations warden is for
 
-## Install
+**A contractor leaves and you cannot remember what they touched.** Over a couple of years you shared a handful of folders with a bookkeeper, some by invitation and some by a link sent in a hurry. Now the engagement is over. Removing them means finding them, and the drive gives you no way to search for a person. Warden asks a single question across a whole folder tree: what can this address still reach? It answers with a list, and it can strip the access it found, showing you the removals first if you ask for a preview. That sweep runs on OneDrive. The same question is answered on either drive by auditing against the policy, which reports every person holding every governed folder.
 
-### Windows (tested on Windows 11)
+**Client folders that must not see each other.** An accountant or a solicitor keeps a folder per client, and the confidentiality duty is not satisfied by having been careful at the time. It is satisfied by being able to show, at any moment, that only the intended people are in each folder. In warden you mark a collection `closed: true`. Anyone reaching a closed folder who is not granted it is reported as a violation rather than a note, including access that leaks down from a parent folder. The audit changes nothing and prints a report, and `--format csv` prints the whole finding set as CSV you can redirect to a file and keep as evidence.
 
-1. Copy the repository directory where you like (`acl-manager.tcl` loads the `lib/` beside it).
-2. Provide `rclone.conf` at `%APPDATA%\rclone\rclone.conf`. A working config is required (untested without one). You don't need rclone itself installed; copying a working `rclone.conf` from another machine is enough.
-3. Install Magicsplat Tcl/Tk 9.0 (other versions untested); it lands at `%APPDATA%\Local\Apps\Tcl90`.
-4. Run it:
-   ```
-   C:>"AppData\Local\Apps\Tcl90\bin\wish.exe" acl-manager.tcl
-   ```
+**A household drive with one folder that must stay shut.** The holiday photos are open to the whole family, the tax folder is not, and the two live on the same drive under folders that were shared and reshared at different times. Warden lets you say that once: a family group with a grant over the photos, a second group with a grant over the tax folder, and `closed: true` on the tax collection so nothing inherited into it goes unremarked.
 
-### Linux and macOS
+**Sharing you no longer remember creating.** Public links live on long after the reason for them. Warden lists the links it finds on a governed folder, and treats a link on a closed collection as a violation. On Dropbox it also sweeps for the records of shared folders you have already deleted, which persist in the account without a path and can still carry a live link.
 
-```bash
-rclone config                              # set up your OneDrive and Dropbox remotes
-sudo apt-get install tcl9.0 tk9.0 tcllib tcl-tls   # Ubuntu/Debian; tk9.0 is for the browser
-brew install tcl-tk                                # macOS
-```
+## How it works
 
-The browser shows one folder tree root per configured remote. A machine with only the OneDrive remote simply has no Dropbox root.
+Everything lives in one YAML file.
 
-## Usage
+**People** are the humans. Each person has a key you choose, a name, and per-platform accounts. A person may hold more than one address on a platform, and the policy still names them once. A person can also have no account on a platform at all; a grant that reaches them there is reported as an unreachable grant, a warning rather than an error, because the policy is recording intent the platform cannot yet carry.
 
-GUI:
-```bash
-./acl-manager                              # opens the browser at the drive root
-wish9.0 acl-manager.tcl "Finance"          # ...starting at a folder
-```
+**Groups** contain people. A group may include other groups, and the membership resolves through the includes.
 
-Run with no arguments and it opens the browser, loading Tk into the interpreter it is already running in. Any argument sends it to the command line instead, so starting the browser at a particular folder means running it under `wish9.0` and naming the folder. Tcl and Tk 9 are required: names on the drive carry characters an older Tcl cannot hold in a string, so the script stops on one rather than show you a name that is not the name.
+**Collections** are named sets of folders. Each folder is addressed by platform, path, and the drive's own stable id, so renaming or moving a folder does not lose it. A collection may include other collections. Marking a collection `closed: true` is the strong statement: at its folders, anyone not entitled is a violation, whether their access is direct or inherited from above.
 
-In the browser, the left pane holds the folder trees (with a per-folder policy badge) and a Groups view of the policy; the right pane holds four tabs. Access shows a folder's ACL with the policy's intent beside the drive's actuality. Policy edits groups, members, collections, and grants (edits rewrite the YAML file, keeping a `.bak`). People shows one row per human with their account on each platform, plus unmapped identities seen on a drive with actions to map, create, or mark them outsiders. Audit runs the same audit as the command line, lets you tick which fixes to apply, previews them as a dry-run change list, and applies only what you ticked.
+**Grants** join a group to a collection at a role. The roles are `read` and `write`.
 
-Command line:
-```bash
-./acl-manager [OPTIONS] [PATH]
-```
-
-`PATH` is the folder or file to inspect (default `/`, the root) and must come after all options. Options take either one dash or two (`-r` or `--recursive`); help prints the single-dash form, both work.
-
-- `-r, --recursive` - scan a folder and its subfolders (default max depth 3)
-- `--max-depth N` - set recursion depth (with `-r`, or alone for any depth)
-- `--type folders|files|both` - what to scan (default `folders`)
-- `--only-user USER` - show only what USER can access (with or without `-r`)
-- `--remove-user USER` - remove USER's access from what's found; destructive, needs `-r` or an explicit depth
-- `--invite USER` - invite USER with read/write, inherited by children; not usable with `-r`
-- `--audit POLICY` - compare live ACLs against a policy file (read-only; see below)
-- `--enforce POLICY` - audit, then fix the drives to match the policy
-- `--platform onedrive|dropbox` - restrict `--audit`/`--enforce` to one platform
-- `--convert-policy POLICY` - print the version-2 (person-based) form of an email-per-member policy file
-- `--dry-run` - preview a `--remove-user` or `--enforce` without changing anything
-- `--read-only` - invite with read-only instead of read/write
-- `--debug` - debug output
-- `--remote REMOTE` - OneDrive remote name (default `OneDrive`)
-- `--help` - show help
-
-### Examples
-
-```bash
-# Audit a folder and everything under it
-./acl-manager -r "Finance"
-
-# ...deeper than the default 3 levels
-./acl-manager -r --max-depth 10 "Projects"
-
-# ...including files, not just folders
-./acl-manager -r --type both "Confidential"
-
-# Find everywhere an ex-employee still has access
-./acl-manager --only-user exemployee@example.com -r "Company"
-
-# One folder, no recursion
-./acl-manager "Finance/Budget2025"
-
-# Whether one user can reach one folder
-./acl-manager --only-user bob@example.com "Finance/Budget2025"
-
-# Remove an ex-employee across a tree: preview first, then do it
-./acl-manager --remove-user exemployee@example.com -r --dry-run "Projects"
-./acl-manager --remove-user exemployee@example.com -r "Projects"
-
-# Invite someone to a folder (children inherit it)
-./acl-manager --invite newaccountant@example.com "Finance"
-
-# ...read-only
-./acl-manager --invite auditor@example.com --read-only "Reports"
-
-# Audit the drive against a policy file, then apply the fixes
-./acl-manager --audit acl-policy.yaml
-./acl-manager --enforce acl-policy.yaml --dry-run
-./acl-manager --enforce acl-policy.yaml
-
-# GUI for interactive browsing
-wish9.0 acl-manager.tcl "Finance"
-```
-
-## Policy files
-
-People forget permissions: they share a folder mid-task, staff leave, folders move, and nobody notices until data has leaked. A policy file turns the intended sharing state into data the tool can check and restore. It is YAML (version 2) with four sections. `people` name each human once, with their contractual relationship, why they hold access, and their account address on each platform (a person can hold several addresses on one platform, and can lack a platform entirely). `groups` collect people by their keys. `collections` name folder sets, each folder carrying its platform, its path (the human label), and its stable id (the id survives renames and moves, which is how drift is caught). `grants` join a group to a collection with a role (`read` or `write`). An optional `outsiders` section lists accounts that belong to no person on purpose, which quiets the People view's suggestions about them.
+A grant applies at its collection's folders and reaches everything beneath them through the drive's own inheritance, so a folder's effective access is what is granted on it plus what is granted on every policy ancestor on the same platform. A closed folder is hermetic: its effective access is what is granted on it alone. Path prefixes on one platform mean nothing on the other, and inheritance is worked out per platform.
 
 ```yaml
 version: 2
 people:
   alice:
     name: Alice Example
-    relationship: accountant
-    reason: quarterly filings
+    relationship: bookkeeper
+    reason: quarterly BAS
     accounts:
       onedrive: alice@corp.example
       dropbox: [alice.p@gmail.example, alice@old.example]
 groups:
-  finance: {members: [alice]}
+  finance: {members: [alice], includes: []}
 collections:
   tax:
     closed: true
     folders:
-      - {platform: onedrive, path: "Finance/Tax", id: "ABC!456"}
+      - {platform: onedrive, path: "/Finance/Tax", id: "ABC!456"}
       - {platform: dropbox,  path: "/Tax",        id: "id:AAA"}
 grants:
   - {collection: tax, group: finance, roles: [write]}
 ```
 
-A policy written in the older email-per-member form converts once with `--convert-policy old.yaml > new.yaml`; members sharing a display name merge into one person holding each address.
+## The browser
 
-Folder paths run from the drive root, so one policy file covers every top-level folder on a drive. A drive holding several companies' folders is governed by one file, and a folder outside every collection is simply not audited. A grant reaching a person with no account on that platform is reported as an unreachable warning, not a violation: the policy records the intent the platform cannot yet carry.
+Run warden with no arguments and it opens the browser. Chips along the top show which drives it found, and the policy strip shows which policy file is loaded, with buttons to open another or reload the current one.
 
-To get the item ids for a new collection, right-click a folder in the browser ("Copy item id"), or list the folder with rclone:
+The left side carries the folder trees, one root per connected drive, expanded as you click. A badge column marks whether a folder is governed by the policy, and after an audit it carries the audit result too. Right-clicking a folder offers to copy its item id, which is what you paste into a collection's folder entry. The Groups view on the left reads the other way round: each group, the collections it has been granted, the role, and the folders inside each collection. Clicking a folder there jumps to that folder's live access.
 
-```bash
-rclone lsjson "OneDrive:Some Folder" --dirs-only | jq -r '.[] | [.ID, .Name] | @tsv'
+The right side holds tabs.
+
+*Access* shows one folder's access control list, with what the policy intends beside what the drive actually has. Columns mark the role the policy expects, the role the drive gives, whether the entry is inherited, whether it comes from a link, and a plain description of the state. Buttons at the foot invite a person or remove the entries you selected. On a Dropbox folder they stand down and say so, because Dropbox changes are made through the Audit tab's fixes or through `--enforce`.
+
+*Policy* is an editor. Groups sit beside the selected group's members, and collections beside that group's grants. You can create and delete groups, add and remove members, add and remove grants, and read the current YAML. Every edit rewrites the policy file itself: warden emits the new file, loads it back to check it parses, keeps a `.bak` of the original, and only then renames the new file into place. An emission that fails to load is discarded and the original is untouched.
+
+*People* gives one row per human, with a column for each platform's account and a state that tells you when someone is known on one drive and not the other. Selecting a person lists everywhere they can reach and at what role. Below that sit the unmapped identities: addresses an audit saw on a drive that belong to no person in the policy, so the list stays empty until an audit has run. Each can be mapped to an existing person, turned into a new person, or marked an outsider.
+
+*Audit* runs the same audit as the command line, over the whole policy or over the selected folder and below. Findings are grouped by folder. Each fixable finding has a tick box, so you choose what to act on. Preview shows the chosen fixes as a change list with nothing yet done, and from there you apply them.
+
+## The command line
+
+Any argument other than a bare `-debug` sends warden to the command line.
+
+```
+warden [OPTIONS] [PATH]
 ```
 
-rclone prints a OneDrive id as `<drive>#<item>` and the policy file takes the part after the `#`; a Dropbox id is used whole (the `id:...` form).
+`PATH` is the folder or file to inspect and defaults to the drive root. Options take one dash or two. Outside `--audit` and `--enforce`, the command line works on OneDrive; Dropbox is reached through the policy.
 
-A grant reaches descendants through the platform's inheritance, so a folder's entitlements are its own grants plus its policy ancestors' on the same platform. A collection marked `closed: true` is the exception: its folders admit exactly their own grants, and anything beyond, direct or inherited, is a violation, as is a shared link on a closed Dropbox folder. `--audit` reports violations folder by folder (`--format csv` for machines) and exits nonzero on any; on Dropbox it also lists records of deleted shares, which persist and can keep live public links (`docs/DROPBOX.md`). `--enforce` invites missing users quietly (no notification email), downgrades or removes wrong ones, and severs inherited excess where the platform allows it: on OneDrive with the move-to-root cycle described in `docs/PHANTOM-INHERITANCE-BUG.md` (re-checking descendants of changed folders for leaked copies afterwards); on Dropbox, where a folder inside a shared folder cannot be detached in place, by naming the ancestor share so the owner decides between removing the member there and relocating the folder.
+- `--audit POLICY` compares the live drives against a policy file and changes nothing. It takes no path and no recursion flags, because the policy defines the folder set. It exits 0 when clean, 1 when it found violations, and 2 when it could not get that far, meaning a policy it could not load or credentials it could not obtain.
+- `--enforce POLICY` audits and then fixes the drives to match, after showing the plan. Add `--dry-run` to see the plan and stop, or `-y` to skip the confirmation.
+- `--platform onedrive|dropbox` restricts an audit or an enforcement to one drive.
+- `-r` scans a folder and everything under it, three levels deep by default; `--max-depth N` sets the depth. `--type folders|files|both` chooses what is scanned.
+- `--only-user USER` reports only what that address can reach, alone for one folder or with `-r` across a tree.
+- `--remove-user USER` strips that address from the folder you name, and with `-r` or an explicit depth from everything beneath it as well. It is destructive, so preview it with `--dry-run` first.
+- `--invite USER` invites someone to a folder with read and write access, inherited by the children below it. `--read-only` invites them as a reader instead.
+- `--set-caption TEXT` writes a OneDrive item's description, which is searchable on the drive. An empty string clears it.
+- `--convert-policy FILE` prints the version-2 form of a policy written with emails in place of people. It touches no drive and needs no credentials.
+- `--format csv` writes the plain access listing or an audit as CSV.
+- `--remote NAME` names the OneDrive rclone remote, `OneDrive` by default.
+- `--debug` prints the service traffic. `--help` lists everything.
 
-## Scheduled audits
+```bash
+# Check the drives against the policy, changing nothing
+warden --audit ~/policy.yaml
 
-Permission drift accumulates quietly, so the audit is worth running on a schedule (weekly suits a small organisation) rather than when someone remembers. The recurring task:
+# Fix them to match it, but show me the plan first
+warden --enforce ~/policy.yaml --dry-run
 
-1. Run `./acl-manager --audit <policy file>`. The repository holding your policy file may wrap this in a make target; if so, run that instead, since it pins the right policy path. A make target reaching a tool in a sibling repository expects both checkouts under one parent directory.
-2. Exit 1 with `❌` lines: the drive drifted. Read what drifted. New shares by colleagues mid-task and leaked inherited copies in locked folders are the common kinds.
-3. Fix by running `--enforce` with the same policy file: first with `--dry-run` to see the change list, then for real. Enforcement touches only what the report showed.
-4. Exit 0 means no violation, and the run is done. The `ℹ️` lines it may still carry are accounts on open collections that the policy does not name, tolerated because enforcement never removes them unasked. They are worth a look when one is new: identify the person (a contacts file or staff register usually settles it), then either send it to the policy's owner to be written into a group with name, relationship, and reason, or to have the access removed. An `ℹ️` line you have already recognised needs nothing.
-5. Exit 2 is a policy-file error, and transport errors mean the run could not see some folders; re-run before trusting either.
+# Everywhere a departing contractor can still reach, ten levels down
+warden --only-user contractor@example.com -r --max-depth 10 "Projects"
 
-Changes to this procedure land in this section, so re-read it when the audit starts behaving differently than described.
+# Take that access away, preview then apply
+warden --remove-user contractor@example.com -r --dry-run "Projects"
+warden --remove-user contractor@example.com -r "Projects"
+```
 
-## Permissions and tokens
+## What warden cannot do
 
-Reading (scanning, listing ACLs) needs the `Files.Read` scope; writing (invite, remove) needs `Files.ReadWrite` plus `Sites.Manage.All`.
+These are the drives' limits, not warden's preferences. Warden reports each of them in plain words rather than failing quietly, but it cannot get past them.
 
-OneDrive tokens come from two places: `rclone.conf` (usually read-only, `Files.Read`) and `token.json` in the application directory (full permissions, created automatically when needed). The app prefers `token.json` and falls back to `rclone.conf` for read-only work. When a write needs more than `rclone.conf` grants, it opens a web sign-in to create or update `token.json`. Expired tokens are refreshed automatically when possible.
+**Dropbox will not grant access to a folder inside a shared folder.** Dropbox shares at the root of a share and nowhere else. If your policy grants someone a folder that sits inside an already-shared ancestor, warden cannot satisfy that grant there. It names the ancestor share and stops. Your options are to grant at the ancestor instead, or to move the folder out of the share.
 
-The Dropbox token is rclone's for the Dropbox remote, used for reading and writing alike; when it has expired, the app has rclone refresh it in place.
+**Dropbox will not let warden take away inherited access at the folder that inherits it.** Warden can remove a member or invitee of the folder's own share. Access arriving from an ancestor share is not removable at the folder, and there is no in-place fix on a Basic plan. Turning inheritance off through the API is restricted to team accounts and is refused on personal ones. Moving the folder out of the share cuts the inheritance only for as long as it stays out. Removing the person at the ancestor takes their access to every sibling folder under it, not just this one. All of those change more than the folder in front of you, so warden names the ancestor share and leaves the decision with you.
 
-Safety: destructive operations prompt for confirmation (not bypassable) and owner permissions can't be removed. Always `--dry-run` a removal first.
+**A Dropbox plan can refuse a membership outright.** When Dropbox answers an invitation with `insufficient_plan`, warden reports that grant as unenforceable and carries on with the rest. Read-only members have worked on the Basic account this was tested against, so this is a refusal warden surfaces if it happens rather than a rule it assumes.
 
-## Troubleshooting
+**OneDrive refuses to share with an address that is not a Microsoft account.** The invitation fails and warden says so. Separately, OneDrive sometimes refuses to send an invitation silently; warden retries in the ordinary way, which means the person receives a notification email, and it tells you that happened.
 
-**Token expired and auto-refresh failed.** For `token.json`, run the GUI and do any write operation to trigger a fresh web sign-in. For `rclone.conf`, run any rclone command, e.g. `rclone about OneDrive:`.
+**OneDrive will not delete an inherited permission in place, and the workaround moves your folder.** Microsoft Graph declines to remove a permission that was inherited from a parent. To sever it, warden moves the folder to the top of your drive, where inheritance no longer applies, deletes the offending permissions there, plants the folder's correct access as explicit permissions so returning it will not simply reattach the old inheritance, and then moves it back. For the duration of that cycle, which includes deliberate waits for the service to settle, the folder is not where it belongs. If the move back fails, warden says so loudly and the folder is left sitting at the drive root for you to put back. Deletions on OneDrive have also been observed to report success while the entry survives, so warden re-reads the folder before it believes any removal, on either drive.
 
-**Missing packages.** `sudo apt-get install tcl9.0 tcllib tcl-tls`.
+Two smaller things worth knowing. Unsharing a folder on Dropbox can change the file id the folder is known by, so an id written into your policy can go stale; warden looks each folder up by its id and reports it as moved when the path it finds is not the path you wrote. And on an open collection, access warden did not expect is reported as a note and tolerated; it is only a violation when you have marked the collection closed.
 
-**`version conflict for package "Tcl": have 8.6.x, need 9`.** The shell that started the script is Tcl 8. On Debian and Ubuntu the unversioned `tclsh` and `wish` are the 8.6 ones, so name `tclsh9.0` or `wish9.0` explicitly.
+## Install
 
-**Access denied.** Check the path, that you're allowed to view the ACL, and that your rclone token has enough scope.
+Warden needs Tcl and Tk version 9. Version 8.6 is refused rather than run in a degraded state: folder and file names on these drives carry characters, emoji among them, that Tcl 8 cannot hold in a string, and warden would rather stop than show you a name that is not the name.
 
-## API
+Copy the repository directory wherever you like. Warden loads its `lib/` from beside itself, so a copied directory is a complete install.
 
-Dropbox: the `/2/files` and `/2/sharing` HTTP endpoints; the behavioural rules the sharing API actually follows are recorded in `docs/DROPBOX.md`.
+```bash
+sudo apt-get install tcl9.0 tk9.0 tcllib tcl-tls    # Debian and Ubuntu
+brew install tcl-tk tcllib tcl-tls                  # macOS
+```
 
-Microsoft Graph:
-- `GET /me/drive/root:/{item-path}` (item info)
-- `GET /me/drive/items/{item-id}/permissions` (permissions)
-- `GET /me/drive/items/{item-id}/children` (folder contents)
-- `POST /me/drive/items/{item-id}/invite` (invite)
-- `DELETE /me/drive/items/{item-id}/permissions/{perm-id}` (remove permission)
+On Windows, Magicsplat Tcl/Tk 9.0 provides both, and warden runs under its `wish.exe`.
 
-OAuth tokens (from `token.json` for full access, else `rclone.conf` read-only) go straight into the requests. The rclone config path is `%APPDATA%\rclone\rclone.conf` on Windows and `~/.config/rclone/rclone.conf` on Unix-like systems.
+## Authenticate
 
-## License
+Warden reads its credentials from rclone's configuration file, in the usual place for your system. Set up a remote for each drive you want warden to see:
 
-MIT, see [LICENSE](LICENSE).
+```bash
+rclone config
+```
+
+Warden discovers every `onedrive` and `dropbox` remote in that file and offers one folder tree per remote. A machine with only a OneDrive remote simply has no Dropbox tree. The browser takes the first remote of each kind it finds, whatever it is called, though its OneDrive calls expect one named `OneDrive` unless you have the stored token described below. On the command line, `--remote` names the OneDrive remote and the Dropbox one is looked for under the name `Dropbox`. Dropbox access tokens expire hourly, and warden asks the installed rclone to refresh one when it finds it stale, so rclone itself needs to be present for Dropbox work rather than just its configuration file.
+
+The rclone credentials are enough for everything that only reads: browsing folders, listing a folder's access, `--only-user` on OneDrive, and `--audit` on either drive. They are also enough for every Dropbox change warden makes.
+
+Changing anything on OneDrive needs a second, more privileged token, because the token rclone holds does not carry the permission to edit sharing. That covers `--invite`, `--remove-user`, `--set-caption`, and `--enforce`. Enforcement opens every platform in the policy for writing before it touches anything, so a policy naming both drives stops without that token even for its Dropbox half, unless you narrow the run with `--platform dropbox`. To obtain it, open the browser and start an operation that changes something. Warden offers you a sign-in through your web browser, stores the resulting token as `token.json` under warden's own configuration directory, and refreshes it there as needed. Once it is stored, the command line uses it too. Asking the command line for a OneDrive change without it produces a refusal that tells you to go and get one.
+
+With the remotes in place, the way in is to open the browser, walk the folder trees to the folders you care about, copy their item ids into a policy file, and run `warden --audit` against it.
