@@ -1,7 +1,8 @@
 #!/usr/bin/env tclsh9.0
 #
-# OneDrive ACL Lister - Tcl/Tk GUI Version with Command Line Support
-# Using rclone.conf token to access Microsoft Graph API directly
+# Warden - role-based access control for OneDrive and Dropbox folders
+# One policy file names the people, the groups they belong to and the folder
+# collections they reach; warden holds both drives to it. Browser and CLI.
 #
 # This script demonstrates how to:
 # 1. Read the OAuth token from rclone.conf
@@ -127,7 +128,7 @@ proc ::ui::build {} {
     package require Ttk
 
     # Create main window
-    wm title . "Cloud ACL Manager"
+    wm title . "Warden"
 
     # Handle window close during OAuth flow
     wm protocol . WM_DELETE_WINDOW {
@@ -219,7 +220,7 @@ proc ::ui::build_chrome {} {
 }
 
 proc ::ui::policy_conf_file {} {
-    return [file join $::env(HOME) .config acl-manager gui-policy-path]
+    return [file join $::env(HOME) .config warden gui-policy-path]
 }
 
 proc ::ui::policy_open {{path ""}} {
@@ -1708,7 +1709,7 @@ proc ::ui::tab_counts {} {
 proc ::ui::audit_cache_file {} {
     variable state
     set hash [format %08x [zlib crc32 [encoding convertto utf-8 $state(policy_path)]]]
-    return [file join $::env(HOME) .cache acl-manager audit-$hash.tcl]
+    return [file join $::env(HOME) .cache warden audit-$hash.tcl]
 }
 
 proc ::ui::audit_persist {} {
@@ -4350,7 +4351,7 @@ proc main {argc argv} {
         set quiet_mode [expr {$output_format eq "csv"}]
 
         if {!$quiet_mode} {
-            puts "OneDrive ACL Inspector"
+            puts "Warden"
             puts "Path: $path"
             puts "Remote: $remote_name"
             if {$max_depth > 0} {
@@ -4433,7 +4434,7 @@ proc ::ui::start {} {
     ::ui::build
     ::ui::policy_startup
 
-    ::ui::status "Cloud ACL Manager - expand a drive to browse" blue
+    ::ui::status "Warden - expand a drive to browse" blue
 
     # Open the first drive's root so the window is not empty
     set root_item [lindex [$w(tree) children {}] 0]

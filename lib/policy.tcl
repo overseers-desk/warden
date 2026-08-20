@@ -468,7 +468,7 @@ proc policy_convert_v1_v2 {v1_path} {
     }
 
     set out {}
-    lappend out "# Desired sharing state, audited and enforced with acl-manager"
+    lappend out "# Desired sharing state, audited and enforced with warden"
     lappend out "# (--audit / --enforce). People are named once with their per-platform"
     lappend out "# accounts; groups reference people; grants join a group to a collection."
     lappend out "version: 2"
@@ -561,7 +561,7 @@ proc policy_v2_emit {raw} {
     # order of the source file do not survive a rewrite; sections come out
     # in the canonical order with people, groups, collections sorted by key.
     set out {}
-    lappend out "# Desired sharing state, audited and enforced with acl-manager"
+    lappend out "# Desired sharing state, audited and enforced with warden"
     lappend out "# (--audit / --enforce). People are named once with their per-platform"
     lappend out "# accounts; groups reference people; grants join a group to a collection."
     lappend out "version: 2"

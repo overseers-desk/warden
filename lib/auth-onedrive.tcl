@@ -30,11 +30,11 @@ proc get_token_file_path {} {
 
     # Determine config directory based on platform
     if {$::tcl_platform(platform) eq "windows"} {
-        set config_dir [file join $::env(APPDATA) "OneDrive-ACL-Manager"]
+        set config_dir [file join $::env(APPDATA) "warden"]
     } elseif {$::tcl_platform(os) eq "Darwin"} {
-        set config_dir [file join $::env(HOME) "Library" "Application Support" "OneDrive-ACL-Manager"]
+        set config_dir [file join $::env(HOME) "Library" "Application Support" "warden"]
     } else {
-        set config_dir [file join $::env(HOME) ".config" "OneDrive-ACL-Manager"]
+        set config_dir [file join $::env(HOME) ".config" "warden"]
     }
 
     # Create directory if it doesn't exist
@@ -320,7 +320,7 @@ proc get_access_token {rclone_remote {require_capability ""} {return_format "sim
         puts "You need to authenticate with OneDrive. You have two options:"
         puts ""
         puts "Option 1: Use browser authentication (recommended)"
-        puts "  1. Run this program in GUI mode: wish acl-manager.tcl"
+        puts "  1. Run this program in GUI mode: wish warden.tcl"
         puts "  2. Click any operation requiring permissions (Invite/Remove)"
         puts "  3. Complete browser authentication"
         puts ""

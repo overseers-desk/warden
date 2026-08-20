@@ -1,17 +1,17 @@
 #!/usr/bin/env tclsh
 # Dropbox sharing operations from the command line: recursive unshare and
 # a listing of top-level shared folders. The machinery lives in
-# lib/provider-dropbox.tcl, shared with acl-manager's audit.
+# lib/provider-dropbox.tcl, shared with warden's audit.
 #
 # Usage:
-#   tclsh dropbox-acl-manager.tcl unshare [-r] <dropbox-path>
-#   tclsh dropbox-acl-manager.tcl list-shares
+#   tclsh warden-dropbox.tcl unshare [-r] <dropbox-path>
+#   tclsh warden-dropbox.tcl list-shares
 
 set libdir [file join [file dirname [file normalize [info script]]] lib]
 source [file join $libdir http.tcl]
 source [file join $libdir provider-dropbox.tcl]
 
-set usage "Usage: tclsh dropbox-acl-manager.tcl <subcommand> \[args\]
+set usage "Usage: tclsh warden-dropbox.tcl <subcommand> \[args\]
 Subcommands:
   unshare \[-r\] <dropbox-path>
   list-shares"
