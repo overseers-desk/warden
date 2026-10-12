@@ -1,0 +1,17 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  body { margin: 0; width: 340px; font: 13px/1.4 system-ui, sans-serif; }
+  button { display: block; width: 100%; box-sizing: border-box; padding: 8px 10px;
+           text-align: left; font: inherit; background: none; border: 0;
+           border-bottom: 1px solid #ddd; cursor: pointer; }
+  button:hover { background: #eef3f8; }
+  button:disabled { cursor: default; background: none; color: #888; }
+  .k { font-weight: 600; }
+  .v { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #345; }
+  #msg { padding: 8px 10px; color: #666; }
+</style>
+<button id="path" hidden><span class="k">Copy path</span><span class="v"></span></button>
+<button id="short" hidden><span class="k">Copy short URL</span><span class="v"></span></button>
+<div id="msg">Reading…</div>
+<script src="popup.js"></script>

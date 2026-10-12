@@ -2,7 +2,11 @@
   "manifest_version": 3,
   "name": "OneDrive Folder Path & Short Link",
   "version": "0.1.0",
-  "description": "Shows the current OneDrive folder's path and a short ?id=<resid> URL that addresses it by id instead of the full path, in a bar at the top of the page.",
+  "description": "Click the toolbar icon on a OneDrive folder to copy its path, or a short ?id=<resid> link that addresses it by id instead of the full path.",
+  "action": {
+    "default_title": "Copy OneDrive folder path or short URL",
+    "default_popup": "popup.html"
+  },
   "content_scripts": [
     {
       "matches": [
