@@ -1868,17 +1868,22 @@ proc children_onedrive {folder_id} {
     } else {
         set children_url [build_graph_api_url "/me/drive/items/$folder_id/children"]
     }
-    lassign [make_http_request $children_url $headers] status data
-    if {$status ne "200"} {
-        debug_log "Error loading tree children: status $status"
-        return ERROR
-    }
     set entries {}
-    foreach child [dict get [json::json2dict $data] value] {
-        lappend entries [dict create \
-            name [dict get $child name] \
-            id [dict get $child id] \
-            is_folder [dict exists $child folder]]
+    while {$children_url ne ""} {
+        lassign [make_http_request $children_url $headers] status data
+        if {$status ne "200"} {
+            debug_log "Error loading tree children: status $status"
+            return ERROR
+        }
+        set page [json::json2dict $data]
+        foreach child [dict get $page value] {
+            lappend entries [dict create \
+                name [dict get $child name] \
+                id [dict get $child id] \
+                is_folder [dict exists $child folder]]
+        }
+        set children_url [expr {[dict exists $page @odata.nextLink]
+            ? [dict get $page @odata.nextLink] : ""}]
     }
     return $entries
 }
