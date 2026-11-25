@@ -1868,22 +1868,17 @@ proc children_onedrive {folder_id} {
     } else {
         set children_url [build_graph_api_url "/me/drive/items/$folder_id/children"]
     }
+    lassign [graph_get_all $children_url $headers] status children
+    if {$status ne "200"} {
+        debug_log "Error loading tree children: status $status"
+        return ERROR
+    }
     set entries {}
-    while {$children_url ne ""} {
-        lassign [make_http_request $children_url $headers] status data
-        if {$status ne "200"} {
-            debug_log "Error loading tree children: status $status"
-            return ERROR
-        }
-        set page [json::json2dict $data]
-        foreach child [dict get $page value] {
-            lappend entries [dict create \
-                name [dict get $child name] \
-                id [dict get $child id] \
-                is_folder [dict exists $child folder]]
-        }
-        set children_url [expr {[dict exists $page @odata.nextLink]
-            ? [dict get $page @odata.nextLink] : ""}]
+    foreach child $children {
+        lappend entries [dict create \
+            name [dict get $child name] \
+            id [dict get $child id] \
+            is_folder [dict exists $child folder]]
     }
     return $entries
 }
@@ -1909,7 +1904,9 @@ proc children_dropbox {folder_id} {
         if {[dict exists $resp has_more] && [dict get $resp has_more]} {
             if {[catch {dbx_call [dict get $ctx token] /2/files/list_folder/continue \
                     [::json::write::object cursor [::json::write::string [dict get $resp cursor]]]} resp]} {
-                break
+                debug_log "Dropbox list_folder/continue failed: $resp"
+                ::ui::status "Dropbox listing failed" red
+                return ERROR
             }
         } else break
     }
@@ -3240,14 +3237,9 @@ proc scan_items_recursive {folder_id access_token max_depth current_depth folder
         # Get children of this folder and recursively check them
         set headers [list Authorization "Bearer $access_token"]
         set children_url [build_graph_api_url "/me/drive/items/$folder_id/children"]
-        set children_result [make_http_request $children_url $headers]
-        set children_status [lindex $children_result 0]
-        set children_data [lindex $children_result 1]
-        
+        lassign [graph_get_all $children_url $headers] children_status children
+
         if {$children_status eq "200"} {
-            set children_dict [json::json2dict $children_data]
-            set children [dict get $children_dict value]
-            
             foreach child $children {
                 set child_name [dict get $child name]
                 
@@ -3509,19 +3501,14 @@ proc list_user_access {item_id user_email max_depth item_type remote_name} {
         puts "✅ Successfully extracted access token from rclone.conf"
         
         # Get permissions
-        set headers [list Authorization "Bearer $access_token"]
-        set permissions_url [build_graph_api_url "/me/drive/items/$item_id/permissions"]
-        set result [make_http_request $permissions_url $headers]
-        set status [lindex $result 0]
-        set data [lindex $result 1]
-        
+        lassign [graph_get_all \
+            [build_graph_api_url "/me/drive/items/$item_id/permissions"] \
+            [list Authorization "Bearer $access_token"]] status permissions
+
         if {$status ne "200"} {
             puts "❌ Failed to get permissions: $status"
             return
         }
-        
-        set permissions_dict [json::json2dict $data]
-        set permissions [dict get $permissions_dict value]
         
         # Check for user permission
         set target_user_lower [string tolower $user_email]

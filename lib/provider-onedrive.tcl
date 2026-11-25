@@ -415,30 +415,31 @@ proc get_item_path {item_id access_token} {
     return $result_path
 }
 
-proc get_folder_permissions {folder_id access_token} {
-    # Get permissions for a folder, following @odata.nextLink pagination
-    # (a permission on page 2 would otherwise read as absent)
-    # Returns list of {status permissions} where status is "ok" or "error"
-    set permissions_url [build_graph_api_url "/me/drive/items/$folder_id/permissions"]
-    set headers [list Authorization "Bearer $access_token"]
-    set permissions {}
-
-    while {$permissions_url ne ""} {
-        set result [make_http_request $permissions_url $headers]
-        set status [lindex $result 0]
-        set data [lindex $result 1]
-
+proc graph_get_all {url headers} {
+    # GET a Graph collection across every @odata.nextLink page; Graph pages
+    # at 200, so anything read from page 1 alone silently loses the rest.
+    # Returns {status items}: status is the failing HTTP status, or 200.
+    set items {}
+    while {$url ne ""} {
+        lassign [make_http_request $url $headers] status data
         if {$status ne "200"} {
-            return [list "error" {}]
+            return [list $status {}]
         }
+        set page [json::json2dict $data]
+        lappend items {*}[dict get $page value]
+        set url [expr {[dict exists $page @odata.nextLink]
+            ? [dict get $page @odata.nextLink] : ""}]
+    }
+    return [list 200 $items]
+}
 
-        set permissions_data [json::json2dict $data]
-        lappend permissions {*}[dict get $permissions_data value]
-        if {[dict exists $permissions_data @odata.nextLink]} {
-            set permissions_url [dict get $permissions_data @odata.nextLink]
-        } else {
-            set permissions_url ""
-        }
+proc get_folder_permissions {folder_id access_token} {
+    # Returns list of {status permissions} where status is "ok" or "error"
+    lassign [graph_get_all \
+        [build_graph_api_url "/me/drive/items/$folder_id/permissions"] \
+        [list Authorization "Bearer $access_token"]] status permissions
+    if {$status ne "200"} {
+        return [list "error" {}]
     }
     return [list "ok" $permissions]
 }
@@ -499,12 +500,13 @@ proc cli_resolve_path_for_command {path remote_name} {
 
 proc fetch_permissions_by_id {item_id access_token} {
     # Get permissions from Microsoft Graph API
-    set permissions_url [build_graph_api_url "/me/drive/items/$item_id/permissions"]
-    
-    set result [make_http_request $permissions_url [list Authorization "Bearer $access_token"]]
-    set status [lindex $result 0]
-    set data [lindex $result 1]
-    
+    if {[catch {graph_get_all \
+            [build_graph_api_url "/me/drive/items/$item_id/permissions"] \
+            [list Authorization "Bearer $access_token"]} result]} {
+        return [list "error" "Failed to parse permissions response: $result"]
+    }
+    lassign $result status permissions
+
     if {$status ne "200"} {
         if {$status eq "403"} {
             return [list "error" "Access denied - you may not have permission to view ACL for this item"]
@@ -512,13 +514,6 @@ proc fetch_permissions_by_id {item_id access_token} {
             return [list "error" "Failed to get ACL: $status"]
         }
     }
-    
-    # Parse permissions response
-    if {[catch {json::json2dict $data} permissions_dict]} {
-        return [list "error" "Failed to parse permissions response: $permissions_dict"]
-    }
-    
-    set permissions [dict get $permissions_dict value]
     return [list "ok" $permissions]
 }
 
