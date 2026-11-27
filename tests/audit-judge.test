@@ -1,0 +1,73 @@
+# The audit's verdicts on an ACL already read, the part the browser's
+# Access tab shares with --audit and --enforce.
+# Run: tclsh9.0 tests/audit-judge.test
+
+package require tcltest
+namespace import ::tcltest::*
+
+set here [file dirname [file normalize [info script]]]
+source [file join [file dirname $here] lib audit.tcl]
+
+proc fentry {closed expected {effective ""}} {
+    if {$effective eq ""} { set effective $expected }
+    return [dict create path /Tax closed $closed collection tax \
+        expected $expected effective $effective]
+}
+
+proc acl {direct inherited {links {}}} {
+    return [dict create direct $direct inherited $inherited \
+        all [dict merge $inherited $direct] links $links]
+}
+
+proc kinds {violations} {
+    set out {}
+    foreach v $violations { lappend out [list [dict get $v type] [dict get $v email]] }
+    return [lsort $out]
+}
+
+test matching-acl {an ACL equal to the grants yields nothing} -body {
+    kinds [audit_judge F1 [fentry 1 {a@x.example write}] [acl {a@x.example write} {}]]
+} -result {}
+
+test missing {a granted account absent from the ACL is missing} -body {
+    kinds [audit_judge F1 [fentry 1 {a@x.example read}] [acl {} {}]]
+} -result {{missing_user a@x.example}}
+
+test read-short-of-write {read where write is granted is missing write} -body {
+    set v [audit_judge F1 [fentry 1 {a@x.example write}] [acl {a@x.example read} {}]]
+    list [kinds $v] [dict get [lindex $v 0] actual]
+} -result {{{missing_user a@x.example}} read}
+
+test wrong-role {direct write where read is granted exceeds entitlement} -body {
+    kinds [audit_judge F1 [fentry 1 {a@x.example read}] [acl {a@x.example write} {}]]
+} -result {{wrong_role a@x.example}}
+
+test extra-closed {an ungranted account on a closed folder is a violation} -body {
+    kinds [audit_judge F1 [fentry 1 {}] [acl {b@x.example read} {}]]
+} -result {{extra_user b@x.example}}
+
+test extra-open {the same account on an open folder is tolerated} -body {
+    kinds [audit_judge F1 [fentry 0 {}] [acl {b@x.example read} {}]]
+} -result {{open_extra b@x.example}}
+
+test leaked-inherited {inherited access beyond entitlement leaks into a closed folder} -body {
+    kinds [audit_judge F1 [fentry 1 {}] [acl {} {b@x.example read}]]
+} -result {{leaked_inherited b@x.example}}
+
+test inherited-entitled {inherited access an ancestor grants is fine on an open folder} -body {
+    kinds [audit_judge F1 [fentry 0 {} {b@x.example read}] [acl {} {b@x.example read}]]
+} -result {}
+
+test link-closed {a listed link on a closed folder is a violation} -body {
+    kinds [audit_judge F1 [fentry 1 {}] [acl {} {} [list [dict create url https://l.example/1]]]]
+} -result {{shared_link {}}}
+
+test link-open {a listed link on an open folder is a note} -body {
+    kinds [audit_judge F1 [fentry 0 {}] [acl {} {} [list [dict create url https://l.example/1]]]]
+} -result {{open_link {}}}
+
+test folder-id-carried {each finding names the folder it was judged for} -body {
+    dict get [lindex [audit_judge F9 [fentry 1 {a@x.example read}] [acl {} {}]] 0] id
+} -result F9
+
+cleanupTests

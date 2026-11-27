@@ -71,6 +71,16 @@ proc audit_folder {provider ctx fid fentry} {
             email "" expected "" actual "" detail "could not read permissions"]
         return [list $violations {} $item_dict]
     }
+    lappend violations {*}[audit_judge $fid $fentry $acl]
+    return [list $violations [dict get $acl all] $item_dict]
+}
+
+proc audit_judge {fid fentry acl} {
+    # The findings for one policy folder given an ACL already read:
+    # {direct inherited all links} as a provider's get_acl returns it.
+    # Pure, so the GUI can judge the ACL it fetched without a second read.
+    set violations {}
+    set rel_path [dict get $fentry path]
     set live_direct [dict get $acl direct]
     set live_inherited [dict get $acl inherited]
     set live_all [dict get $acl all]
@@ -142,7 +152,7 @@ proc audit_folder {provider ctx fid fentry} {
         }
     }
 
-    return [list $violations $live_all $item_dict]
+    return $violations
 }
 
 proc plan_ids_parents_first {plan} {

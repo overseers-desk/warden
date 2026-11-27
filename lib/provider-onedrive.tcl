@@ -624,11 +624,16 @@ proc od_item_path {ctx item_dict} {
 }
 
 proc od_get_acl {ctx fid} {
-    # {status acl}: acl holds email -> role dicts for direct, inherited,
-    # and all non-owner permissions. links stays empty here: OneDrive link
-    # shares surface as permission entries already.
+    # {status acl}, acl as od_acl_from_permissions builds it
     lassign [get_folder_permissions $fid [dict get $ctx token]] status permissions
     if {$status ne "ok"} { return [list $status {}] }
+    return [list ok [od_acl_from_permissions $permissions]]
+}
+
+proc od_acl_from_permissions {permissions} {
+    # email -> role dicts for direct, inherited, and all non-owner
+    # permissions. links stays empty, and a link permission carries no
+    # email, so the audit does not see OneDrive link shares yet.
     set direct_perms {}
     set inherited_perms {}
     foreach perm $permissions {
@@ -639,11 +644,11 @@ proc od_get_acl {ctx fid} {
             lappend direct_perms $perm
         }
     }
-    return [list ok [dict create \
+    return [dict create \
         direct [extract_users_from_permissions $direct_perms] \
         inherited [extract_users_from_permissions $inherited_perms] \
         all [extract_users_from_permissions $permissions] \
-        links {}]]
+        links {}]
 }
 
 proc od_invite {ctx fid email role} {
