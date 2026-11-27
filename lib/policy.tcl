@@ -314,8 +314,8 @@ proc policy_load_v2 {yaml_path} {
     }
 
     # Outsiders: accounts seen on a drive that belong to no person and,
-    # by the owner's decision, never will; the People view stops
-    # suggesting them.
+    # by the owner's decision, never will; the Audit tab stops listing
+    # them among the accounts no person holds.
     set outsiders {}
     if {[dict exists $policy outsiders]} {
         foreach o [dict get $policy outsiders] {
