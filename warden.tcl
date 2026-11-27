@@ -247,6 +247,7 @@ proc ::ui::policy_open {{path ""}} {
     $w(policy_label) configure -text $path -foreground black
     catch {::ui::audit_restore}
     catch {::ui::badges_refresh}
+    catch {::ui::access_render}
     set nwarn [llength [dict get $model warnings]]
     set summary "Policy: [file tail $path] loaded"
     if {$nwarn > 0} { append summary " ($nwarn unreachable grant(s))" }
@@ -495,22 +496,33 @@ proc ::ui::build_acl_pane {} {
         }
     }
 
-    # Fetch button at top of right pane
-    set w(fetch) [ttk::button $right_frame.fetch -text "Fetch ACL" \
-        -command on_fetch_button_click -state disabled]
-    pack $w(fetch) -anchor w -pady {0 5}
-
-    # ACL path label (shows which item's ACL is displayed)
+    # What the selected folder is and what the policy says of it
     pack [ttk::frame $right_frame.path] -fill x -pady {0 5}
     ttk::label $right_frame.path.label -text "Item:"
     pack $right_frame.path.label -side left
     set w(item_entry) [ttk::entry $right_frame.path.entry]
     pack $w(item_entry) -side left -fill x -expand yes -padx {5 0}
     $w(item_entry) configure -state readonly
-
-    # What the policy says about this folder
     set w(governed) [ttk::label $right_frame.governed -text "" -wraplength 640 -justify left]
     pack $w(governed) -fill x -anchor w -pady {0 5}
+
+    # The one way to read the folder's actual permissions, centred under
+    # the message saying the table holds the policy alone until then
+    set base [font actual TkDefaultFont]
+    font create ::ui::fetch_font {*}$base -weight bold \
+        -size [expr {int(round([dict get $base -size] * 1.3))}]
+    ttk::style configure Fetch.TButton -font ::ui::fetch_font -padding {28 10} \
+        -foreground white -background "#2f6fb0"
+    ttk::style map Fetch.TButton \
+        -background {disabled "#9fb6cf" pressed "#24578c" active "#3a7fc4"} \
+        -foreground {disabled "#eef2f6"}
+    set w(prompt) [ttk::frame $right_frame.prompt]
+    pack $w(prompt) -fill x -pady {2 8}
+    set w(prompt_msg) [ttk::label $w(prompt).msg -justify center -anchor center \
+        -text "Showing the Policy only, click Fetch ACL to get the actual permission at work in the cloud"]
+    set w(fetch) [ttk::button $w(prompt).fetch -text "Fetch ACL" -style Fetch.TButton \
+        -command on_fetch_button_click -state disabled]
+    pack $w(fetch) -anchor center
 
     # Create treeview frame for ACL display
     pack [ttk::frame $right_frame.tree] -fill both -expand yes
@@ -519,21 +531,20 @@ proc ::ui::build_acl_pane {} {
     pack [ttk::scrollbar $right_frame.tree.hscroll -orient horizontal -command "$right_frame.tree.list xview"] -side bottom -fill x
     pack [ttk::scrollbar $right_frame.tree.vscroll -orient vertical -command "$right_frame.tree.list yview"] -side right -fill y
 
-    # Treeview widget (with multi-select enabled)
-    set w(acl) [ttk::treeview $right_frame.tree.list -columns {user policy drive inherited link state id} -show {tree headings} -selectmode extended \
-        -displaycolumns {user policy drive inherited link state} \
+    # One row per account: the policy's people first, then whatever else
+    # the fetch found; the hidden id column holds the permission id
+    set w(acl) [ttk::treeview $right_frame.tree.list -columns {account policy actual via state id} -show {tree headings} -selectmode extended \
+        -displaycolumns {account policy actual via state} \
         -yscrollcommand "$right_frame.tree.vscroll set" -xscrollcommand "$right_frame.tree.hscroll set"]
     pack $w(acl) -side left -fill both -expand yes
 
-    # Intended (policy) beside actual (drive), as in the design mockup
     configure_tree_columns $w(acl) {
-        #0 "Email" 150 100
-        user "User" 110 80
-        policy "Policy" 90 60
-        drive "Drive" 60 45
-        inherited "Inherit" 55 45
-        link "Link" 70 45
-        state "State" 190 120
+        #0 "Person" 220 110
+        account "Account" 200 120
+        policy "Policy expects" 110 70
+        actual "Actual" 90 50
+        via "Via" 160 80
+        state "State" 240 120
     }
 
     # Configure tags for different permission types
@@ -541,6 +552,10 @@ proc ::ui::build_acl_pane {} {
     $w(acl) tag configure write -background lightblue
     $w(acl) tag configure read -background lightyellow
     $w(acl) tag configure inherited -background lightgray
+    $w(acl) tag configure gap -background {#faf8ee}
+    $w(acl) tag configure section -background gray92 -font TkHeadingFont
+    $w(acl) tag configure unread -foreground gray45
+    $w(acl) tag configure warn -foreground {#7a5200}
     $w(acl) tag configure missing -foreground red3
     $w(acl) tag configure violation -foreground red3
 
@@ -550,8 +565,7 @@ proc ::ui::build_acl_pane {} {
         set acl_tree $::ui::w(acl)
         set selection [$acl_tree selection]
         if {[llength $selection] > 0} {
-            set item [lindex $selection 0]
-            set email [$acl_tree item $item -text]
+            set email [$acl_tree set [lindex $selection 0] account]
             clipboard clear
             clipboard append $email
         }
@@ -567,24 +581,16 @@ proc ::ui::build_acl_pane {} {
         }
     }
 
-    # Bind treeview selection event to enable/disable Remove button. Bound
-    # once here rather than re-bound on every fetch.
-    bind $w(acl) <<TreeviewSelect>> {
-        set acl_tree $::ui::w(acl)
-        set selection [$acl_tree selection]
-        if {[llength $selection] > 0} {
-            $::ui::w(btn_remove) configure -state normal
-        } else {
-            $::ui::w(btn_remove) configure -state disabled
-        }
-    }
+    # The buttons follow the selected rows
+    bind $w(acl) <<TreeviewSelect>> ::ui::access_selection_changed
 
     # Action buttons frame at bottom of right pane
     set w(action_frame) [ttk::frame $right_frame.actions]
     pack $w(action_frame) -side bottom -fill x -pady {10 0}
 
     set w(btn_remove) [ttk::button $right_frame.actions.remove -text "Remove Selected" -command on_remove_selected_click -state disabled]
-    set w(btn_invite) [ttk::button $right_frame.actions.invite -text "Invite User" -command on_invite_user_click -state disabled]
+    set w(btn_invite) [ttk::button $right_frame.actions.invite -text "Invite User…" -command ::ui::access_invite -state disabled]
+    set w(btn_addpol) [ttk::button $right_frame.actions.addpol -text "Add to policy…" -command ::ui::access_add_to_policy]
 
     pack $w(btn_remove) -side left -padx 2
     pack $w(btn_invite) -side left -padx 2
@@ -1133,9 +1139,10 @@ proc ::ui::unmapped_selected {} {
         [lindex [$w(unmapped) item $row -values] 0]]
 }
 
-proc ::ui::unmapped_map {} {
+proc ::ui::unmapped_map {{pick ""}} {
+    # pick: {email platform}; the unmapped list's selection when empty
     variable state
-    set pick [::ui::unmapped_selected]
+    if {$pick eq ""} { set pick [::ui::unmapped_selected] }
     if {$pick eq ""} { return }
     lassign $pick email platform
     set slugs [lsort [dict keys [dict get $state(model) people]]]
@@ -1930,23 +1937,6 @@ proc ::ui::dropbox_ctx {} {
     return $state(dbx_ctx)
 }
 
-proc gui_clear_acl_display {} {
-    set acl_tree $::ui::w(acl)
-    foreach item [$acl_tree children {}] {
-        $acl_tree delete $item
-    }
-
-    $::ui::w(item_entry) configure -state normal
-    $::ui::w(item_entry) delete 0 end
-    $::ui::w(item_entry) insert 0 "(No ACL loaded - click Fetch ACL)"
-    $::ui::w(item_entry) configure -state readonly
-
-    $::ui::w(btn_remove) configure -state disabled
-    $::ui::w(btn_invite) configure -state disabled
-
-    debug_log "ACL display cleared"
-}
-
 proc build_tree_path {tree item} {
     # Build hierarchical path from root to the given tree item
     set path_parts {}
@@ -2026,11 +2016,9 @@ proc on_tree_select {tree} {
         $path_widget insert 0 $hierarchical_path
         $path_widget configure -state readonly
 
-        # Clear ACL display (user must click Fetch to see ACL)
-        gui_clear_acl_display
-
-        # Enable fetch button (user can now fetch ACL for this item)
-        $::ui::w(fetch) configure -state normal
+        # A new folder: the earlier fetch no longer applies
+        unset -nocomplain ::ui::state(acl_snapshot)
+        ::ui::access_render
     }
 }
 
@@ -2784,7 +2772,7 @@ proc ensure_edit_capability {} {
     }
 }
 
-proc on_invite_user_click {} {
+proc on_invite_user_click {{prefill_email ""} {prefill_role read}} {
     if {[info exists ::ui::state(sel_provider)] && $::ui::state(sel_provider) eq "dropbox"} {
         ::ui::status "Inviting on Dropbox is done through policy enforcement for now" orange
         return
@@ -2818,7 +2806,8 @@ proc on_invite_user_click {} {
     ttk::frame $dialog.role_frame
     ttk::radiobutton $dialog.role_frame.read -text "Read (view only)" -variable invite_role -value "read"
     ttk::radiobutton $dialog.role_frame.write -text "Write (can edit)" -variable invite_role -value "write"
-    set ::invite_role "read"
+    set ::invite_role $prefill_role
+    $dialog.email_entry insert 0 $prefill_email
     
     # Write into the policy too, so the next audit expects what was
     # just shared instead of reporting it as extra access
@@ -2984,8 +2973,8 @@ proc on_remove_selected_click {} {
     ::ui::status "Removing $count permission(s)..." blue
     
     foreach item $selection {
-        set values [$tree item $item -values]
-        set permission_id [lindex $values 6]
+        if {[llength [$tree item $item -values]] < 6} { continue }
+        set permission_id [$tree set $item id]
         if {$permission_id eq ""} { continue }
 
         set remove_result [remove_permission $current_item_id $permission_id $access_token]
@@ -3687,13 +3676,13 @@ proc ::ui::update_governed {platform fid} {
     variable w
     variable state
     if {![info exists state(model)] || $state(model) eq ""} {
-        $w(governed) configure -text "No policy loaded." -foreground gray40
+        $w(governed) configure -text ""
         return
     }
     set model $state(model)
     if {![dict exists $model plan $platform $fid]} {
         $w(governed) configure -foreground gray30 -text \
-            "Governed by nothing: this folder is in no collection, so the audit does not check it. Its access is whatever the drive says."
+            "Governed by nothing: this folder is in no collection, so the policy expects no one here and the audit does not check it."
         return
     }
     set fentry [dict get $model plan $platform $fid]
@@ -3722,25 +3711,324 @@ proc ::ui::state_cell {violations email} {
     return [list "\u2713 matches policy" {}]
 }
 
-proc ::ui::audit_one_folder {platform fid} {
-    # This folder's violations, or "" when it is ungoverned or offline.
-    # Runs the same audit_folder the CLI uses, through the platform's
-    # provider, so the Access tab can never disagree with the audit.
-    variable state
-    if {![info exists state(model)] || $state(model) eq ""} { return "" }
-    if {![dict exists $state(model) plan $platform $fid]} { return "" }
-    set provider [provider_for $platform]
-    if {$platform eq "dropbox"} {
-        set ctx [::ui::dropbox_ctx]
-    } else {
-        set result [get_access_token [$::ui::w(remote_entry) get] "" "detailed" 1]
-        set token [lindex $result 0]
-        if {$token eq ""} { return "" }
-        set ctx [dict create token $token remote [$::ui::w(remote_entry) get]]
+proc ::ui::platform_label {platform} {
+    return [expr {$platform eq "dropbox" ? "Dropbox" : "OneDrive"}]
+}
+
+proc ::ui::live_entries {snap} {
+    # The fetched permissions as rows: {email name role via id owner link}.
+    # OneDrive keeps its raw records; Dropbox arrives as its provider's ACL.
+    set out {}
+    if {[dict get $snap platform] eq "dropbox"} {
+        set acl [dict get $snap acl]
+        foreach {source via} {direct direct inherited inherited} {
+            dict for {email role} [dict get $acl $source] {
+                lappend out [dict create email [string tolower $email] name "" role $role \
+                    via $via id "" owner 0 link 0]
+            }
+        }
+        foreach link [dict get $acl links] {
+            lappend out [dict create email "" name "anyone with the link" role read \
+                via "link: [dict get $link url]" id "" owner 0 link 1]
+        }
+        return $out
     }
-    if {$ctx eq ""} { return "" }
-    lassign [audit_folder $provider $ctx $fid [dict get $state(model) plan $platform $fid]] violations _ _
-    return $violations
+    foreach perm [dict get $snap permissions] {
+        set roles [dict get $perm roles]
+        set owner [expr {"owner" in $roles}]
+        set role [expr {$owner ? "owner" : ("write" in $roles ? "write" : "read")}]
+        # A share link is a record with link.type; every record carries
+        # link.webUrl, the item's own address, so link alone says nothing
+        set link [dict exists $perm link type]
+        if {$link} {
+            set via "link: [dict get $perm link type]"
+            if {[dict exists $perm link scope]} { append via ", [dict get $perm link scope]" }
+        } elseif {[is_inherited_permission $perm]} {
+            set via "inherited"
+            if {[dict exists $perm inheritedFrom path]} {
+                set from [dict get $perm inheritedFrom path]
+                set cut [string first "root:" $from]
+                if {$cut >= 0} { set from [string range $from [expr {$cut + 5}] end] }
+                if {$from ne ""} { set via "inherited from $from" }
+            }
+        } else {
+            set via "direct"
+        }
+        set id [expr {$owner ? "" : [dict get $perm id]}]
+        set users [extract_users_from_perm $perm]
+        if {[llength $users] == 0} {
+            set name [expr {$link ? "anyone with the link" : "unnamed permission"}]
+            lappend out [dict create email "" name $name role $role via $via id $id owner $owner link $link]
+            continue
+        }
+        foreach u $users {
+            lappend out [dict create email [string tolower [lindex $u 1]] name [lindex $u 0] \
+                role $role via $via id $id owner $owner link $link]
+        }
+    }
+    return $out
+}
+
+proc ::ui::policy_rows {model platform fid} {
+    # Who the policy expects on this folder: {key email person role note}
+    # rows, in display order. note is "via <path>" for a grant that reaches
+    # here from a policy ancestor, or "unreachable" for a person granted
+    # here with no account on this platform.
+    set fentry [dict get $model plan $platform $fid]
+    set expected [dict get $fentry expected]
+    set rows {}
+    dict for {email role} $expected {
+        lappend rows [list "acct:$email" $email \
+            [identity_display $model [identity_person_for $model $platform $email]] $role ""]
+    }
+    # Allowed through an ancestor: the nearest policy ancestor granting it
+    set fpath [dict get $fentry path]
+    dict for {email role} [dict get $fentry effective] {
+        if {[dict exists $expected $email]} { continue }
+        set from ""
+        dict for {aid aentry} [dict get $model plan $platform] {
+            set apath [dict get $aentry path]
+            if {$aid eq $fid || ![dict exists $aentry expected $email]} { continue }
+            if {($apath eq "/" || [string match "$apath/*" $fpath]) && \
+                [string length $apath] > [string length $from]} { set from $apath }
+        }
+        lappend rows [list "acct:$email" $email \
+            [identity_display $model [identity_person_for $model $platform $email]] $role "via $from"]
+    }
+    # Granted here but with no account on this platform to carry it
+    set raw [dict get $model raw]
+    set seen {}
+    foreach wn [dict get $model warnings] {
+        if {[dict get $wn type] ne "unreachable_grant" || [dict get $wn platform] ne $platform} { continue }
+        set slug [dict get $wn person]
+        if {[dict exists $seen $slug]} { continue }
+        if {[catch {policy_v2_resolve_collection [dict get $raw collections] [dict get $wn collection] {}} folders]} { continue }
+        foreach f $folders {
+            if {[dict get $f platform] eq $platform && [dict get $f id] eq $fid} {
+                dict set seen $slug 1
+                lappend rows [list "nobody:$slug" "" [identity_display $model $slug] \
+                    [dict get $wn role] unreachable]
+                break
+            }
+        }
+    }
+    return [lsort -index 2 -dictionary $rows]
+}
+
+proc ::ui::access_render {} {
+    # The Access table from the loaded policy and the stored fetch, either
+    # of which may be absent: before a fetch the policy's people alone,
+    # after it the same rows filled in and the unexpected below them.
+    variable w
+    variable state
+    global selected_item
+    set tree $w(acl)
+    foreach row [$tree children {}] { $tree delete $row }
+    pack forget $w(prompt_msg)
+    pack forget $w(btn_addpol)
+    if {![info exists selected_item] || [llength $selected_item] == 0 \
+        || ![dict exists $selected_item id]} { return }
+    set fid [dict get $selected_item id]
+    set platform [expr {[dict exists $selected_item provider] ? [dict get $selected_item provider] : "onedrive"}]
+    set model [expr {[info exists state(model)] ? $state(model) : ""}]
+    set snap ""
+    if {[info exists state(acl_snapshot)] && [dict get $state(acl_snapshot) platform] eq $platform \
+        && [dict get $state(acl_snapshot) fid] eq $fid} {
+        set snap $state(acl_snapshot)
+    }
+    set governed [expr {$model ne "" && [dict exists $model plan $platform $fid]}]
+    ::ui::update_governed $platform $fid
+
+    $w(item_entry) configure -state normal
+    $w(item_entry) delete 0 end
+    $w(item_entry) insert 0 [expr {$snap ne "" ? [dict get $snap name] : [$w(path_entry) get]}]
+    $w(item_entry) configure -state readonly
+
+    $w(fetch) configure -state normal
+    if {$snap eq ""} {
+        $w(fetch) configure -text "Fetch ACL" -style Fetch.TButton
+        if {$governed} { pack $w(prompt_msg) -before $w(fetch) -pady {0 8} }
+    } else {
+        $w(fetch) configure -text "Refresh ACL" -style TButton
+    }
+    $w(btn_invite) configure -state [expr {$snap ne "" && $platform eq "onedrive" ? "normal" : "disabled"}] \
+        -text "Invite User…"
+    $w(btn_remove) configure -state disabled
+
+    set live [expr {$snap ne "" ? [::ui::live_entries $snap] : {}}]
+    set violations {}
+    if {$snap ne "" && $governed} {
+        set fentry [dict get $model plan $platform $fid]
+        if {$platform eq "dropbox"} {
+            set acl [dict get $snap acl]
+        } else {
+            set acl [od_acl_from_permissions [dict get $snap permissions]]
+        }
+        set violations [audit_judge $fid $fentry $acl]
+    }
+
+    # The policy's people, filled in from the fetch when there is one
+    set taken {}
+    if {$governed} {
+        set prows [::ui::policy_rows $model $platform $fid]
+        $tree insert {} end -id sec:policy -text "The policy expects ([llength $prows])" \
+            -open 1 -tags section
+        foreach r $prows {
+            lassign $r key email person role note
+            set pcell [expr {[string match "via *" $note] ? "$role ($note)" : $role}]
+            if {$note eq "unreachable"} {
+                set pl [::ui::platform_label $platform]
+                $tree insert sec:policy end -id $key -text $person \
+                    -values [list "no $pl account" $pcell "—" "—" "⚠ cannot be invited: no $pl account" ""] \
+                    -tags {gap warn}
+                continue
+            }
+            if {$snap eq ""} {
+                $tree insert sec:policy end -id $key -text $person \
+                    -values [list $email $pcell "not fetched" "not fetched" "expected" ""] -tags unread
+                continue
+            }
+            set hits {}
+            foreach e $live { if {[dict get $e email] eq $email} { lappend hits $e } }
+            if {[llength $hits] == 0} {
+                lassign [::ui::state_cell $violations $email] scell stag
+                $tree insert sec:policy end -id $key -text $person \
+                    -values [list $email $pcell "—" "—" $scell ""] -tags [list missing $stag]
+                continue
+            }
+            dict set taken $email 1
+            set n 0
+            foreach e $hits {
+                set rid [expr {$n == 0 ? $key : "$key#$n"}]
+                incr n
+                ::ui::access_insert_live $tree sec:policy $rid $person $pcell $e $violations $model $governed
+            }
+        }
+    }
+
+    # Whatever else the fetch found
+    if {$snap ne ""} {
+        set rest {}
+        foreach e $live {
+            if {[dict get $e email] ne "" && [dict exists $taken [dict get $e email]]} { continue }
+            lappend rest $e
+        }
+        set title [expr {$governed ? "Not expected by the policy ([llength $rest])" \
+            : "Actual permissions ([llength $rest])"}]
+        $tree insert {} end -id sec:rest -text $title -open 1 -tags section
+        set n 0
+        foreach e [lsort -command ::ui::live_order $rest] {
+            set email [dict get $e email]
+            set rid [expr {$email ne "" && ![$tree exists "acct:$email"] ? "acct:$email" : "live:[incr n]"}]
+            set person [dict get $e name]
+            if {$model ne "" && $email ne ""} {
+                set slug [identity_person_for $model $platform $email]
+                if {$slug ne ""} {
+                    set person [identity_display $model $slug]
+                } elseif {![dict get $e owner]} {
+                    set person "not in policy"
+                }
+            }
+            ::ui::access_insert_live $tree sec:rest $rid $person "—" $e $violations $model $governed
+        }
+    }
+}
+
+proc ::ui::live_order {a b} {
+    # Owner first, then accounts by address, links last
+    set ka [list [expr {![dict get $a owner]}] [dict get $a link] [dict get $a email]]
+    set kb [list [expr {![dict get $b owner]}] [dict get $b link] [dict get $b email]]
+    return [string compare $ka $kb]
+}
+
+proc ::ui::access_insert_live {tree parent rid person pcell e violations model governed} {
+    # One fetched permission as a row, with the audit's verdict on it
+    set email [dict get $e email]
+    set role [dict get $e role]
+    if {[dict get $e owner]} {
+        set scell "owner (not audited)"
+        set stag {}
+    } elseif {[dict get $e link] && $email eq ""} {
+        # Links carry no account, and OneDrive's do not reach the audit yet
+        set scell "link: not checked by the audit"
+        set stag {}
+        foreach v $violations {
+            switch [dict get $v type] {
+                shared_link { set scell "❌ LINK on a closed collection"; set stag violation }
+                open_link { set scell "ℹ link, tolerated" }
+            }
+        }
+    } elseif {$email eq ""} {
+        set scell "names no account; not audited"
+        set stag {}
+    } elseif {$model eq ""} {
+        set scell ""
+        set stag {}
+    } elseif {!$governed} {
+        set scell "not governed"
+        set stag {}
+    } else {
+        lassign [::ui::state_cell $violations $email] scell stag
+    }
+    set tags [list [expr {$role in {owner write} ? $role : "read"}]]
+    if {[string match "inherited*" [dict get $e via]]} { lappend tags inherited }
+    if {$stag ne ""} { lappend tags $stag }
+    $tree insert $parent end -id $rid -text $person \
+        -values [list [expr {$email ne "" ? $email : "—"}] $pcell $role [dict get $e via] $scell [dict get $e id]] \
+        -tags $tags
+}
+
+proc ::ui::access_selection_changed {} {
+    # Remove needs a permission id; Invite fills in a missing account;
+    # Add to policy offers an account no person holds
+    variable w
+    variable state
+    set tree $w(acl)
+    set sel [$tree selection]
+    set removable 0
+    foreach item $sel {
+        if {[$tree exists $item] && [llength [$tree item $item -values]] > 5 && [$tree set $item id] ne ""} {
+            set removable 1
+        }
+    }
+    $w(btn_remove) configure -state [expr {$removable ? "normal" : "disabled"}]
+    pack forget $w(btn_addpol)
+    if {[$w(btn_invite) cget -state] eq "disabled"} { return }
+    $w(btn_invite) configure -text "Invite User…"
+    if {[llength $sel] != 1} { return }
+    set item [lindex $sel 0]
+    if {[llength [$tree item $item -values]] < 6} { return }
+    if {[string match "❌ MISSING*" [$tree set $item state]]} {
+        set role [lindex [split [$tree set $item policy] " "] 0]
+        $w(btn_invite) configure -text "Invite [$tree set $item account] as $role"
+    }
+    if {[$tree item $item -text] eq "not in policy"} {
+        pack $w(btn_addpol) -side left -padx 2
+    }
+}
+
+proc ::ui::access_invite {} {
+    # The Invite dialog, filled in when a missing account is selected
+    variable w
+    set tree $w(acl)
+    set sel [$tree selection]
+    if {[llength $sel] == 1 && [llength [$tree item [lindex $sel 0] -values]] > 5 \
+        && [string match "❌ MISSING*" [$tree set [lindex $sel 0] state]]} {
+        set item [lindex $sel 0]
+        on_invite_user_click [$tree set $item account] [lindex [split [$tree set $item policy] " "] 0]
+    } else {
+        on_invite_user_click
+    }
+}
+
+proc ::ui::access_add_to_policy {} {
+    # Map the selected account the policy does not name to a person
+    variable w
+    variable state
+    set sel [$w(acl) selection]
+    if {[llength $sel] != 1} { return }
+    set platform [expr {[info exists state(sel_provider)] ? $state(sel_provider) : "onedrive"}]
+    ::ui::unmapped_map [list [$w(acl) set [lindex $sel 0] account] $platform]
 }
 
 proc gui_fetch_acl_dropbox {fid} {
@@ -3766,74 +4054,15 @@ proc gui_fetch_acl_dropbox {fid} {
         return
     }
 
-    set acl_tree $::ui::w(acl)
-    foreach row [$acl_tree children {}] { $acl_tree delete $row }
-    $::ui::w(item_entry) configure -state normal
-    $::ui::w(item_entry) delete 0 end
-    $::ui::w(item_entry) insert 0 $path
-    $::ui::w(item_entry) configure -state readonly
-
-    ::ui::update_governed dropbox $fid
-    set model ""
-    if {[info exists ::ui::state(model)]} { set model $::ui::state(model) }
-    set violations [::ui::audit_one_folder dropbox $fid]
-    set bound {}
-    set governed 0
-    if {$model ne "" && [dict exists $model plan dropbox $fid]} {
-        set governed 1
-        set bound [dict get $model plan dropbox $fid expected]
-    }
-
-    set rows 0
-    set seen {}
-    foreach {source inherited_str} {direct No inherited Yes} {
-        foreach email [lsort [dict keys [dict get $acl $source]]] {
-            set role [dict get $acl $source $email]
-            dict set seen $email 1
-            set who ""
-            if {$model ne ""} {
-                set who [identity_display $model [identity_person_for $model dropbox $email]]
-            }
-            set policy_cell "\u2014"
-            if {[dict exists $bound $email]} { set policy_cell [dict get $bound $email] }
-            if {$governed} {
-                lassign [::ui::state_cell $violations $email] state_cell state_tag
-            } else {
-                set state_cell [expr {$model eq "" ? "" : "not audited"}]
-                set state_tag {}
-            }
-            set tags [list $role]
-            if {$source eq "inherited"} { lappend tags inherited }
-            if {$state_tag ne ""} { lappend tags $state_tag }
-            $acl_tree insert {} end -text $email \
-                -values [list $who $policy_cell $role $inherited_str "-" $state_cell ""] \
-                -tags $tags
-            incr rows
-        }
-    }
-    dict for {email role} $bound {
-        if {[dict exists $seen $email]} { continue }
-        set who ""
-        if {$model ne ""} {
-            set who [identity_display $model [identity_person_for $model dropbox $email]]
-        }
-        $acl_tree insert {} end -text $email \
-            -values [list $who $role "\u2014" "\u2014" "-" "\u274c MISSING \u2014 invite as $role" ""] \
-            -tags missing
-        incr rows
-    }
-    foreach link [dict get $acl links] {
-        $acl_tree insert {} end -text "(shared link)" \
-            -values [list "anyone with the URL" "\u2014" read No link "" ""] \
-            -tags read
-        incr rows
-    }
-    ::ui::status "Dropbox ACL: $rows entr(ies) on $path" blue
+    set ::ui::state(acl_snapshot) [dict create platform dropbox fid $fid name $path \
+        read_at [clock seconds] acl $acl]
+    ::ui::access_render
+    set n [expr {[dict size [dict get $acl all]] + [llength [dict get $acl links]]}]
+    ::ui::status "Dropbox ACL: $n entr(ies) on $path" blue
 }
 
 proc gui_fetch_acl {item_id remote_name} {
     global current_item_id token_capability
-    set acl_tree $::ui::w(acl)
 
     if {$item_id eq ""} {
         ::ui::status "Error: Invalid item ID" red
@@ -3895,160 +4124,22 @@ proc gui_fetch_acl {item_id remote_name} {
     # Store current item ID for edit operations
     set current_item_id $item_id
     
-    # Update ACL path label with item name (no path lookup needed - GUI works with IDs only)
-    $::ui::w(item_entry) configure -state normal
-    $::ui::w(item_entry) delete 0 end
-    $::ui::w(item_entry) insert 0 $item_name
-    $::ui::w(item_entry) configure -state readonly
-    
     ::ui::status "✅ Found $item_type" green
-
-    foreach item [$acl_tree children {}] {
-        $acl_tree delete $item
-    }
-    ::ui::status "Treeview cleared" green
 
     ::ui::status "Getting ACL..." blue
     set perm_result [fetch_permissions_by_id $item_id $access_token]
     set perm_status [lindex $perm_result 0]
     set permissions [lindex $perm_result 1]
-    
+
     if {$perm_status ne "ok"} {
         ::ui::status "❌ $permissions" red
         return
     }
-    
-    set perm_count [llength $permissions]
 
-    if {$perm_count == 0} {
-        ::ui::status "ℹ️ No permissions found for this item (empty ACL)" orange
-        return
-    }
-    
-    ::ui::status "✅ Found $perm_count permission(s) in ACL (Token: $capability)" green
-
-    # Sort permissions: non-inherited first, then inherited, each group sorted by email
-    set sorted_permissions [lsort -command {
-        apply {{a b} {
-            set inherited_a [dict exists $a inheritedFrom]
-            set inherited_b [dict exists $b inheritedFrom]
-
-            # Non-inherited (0) comes before inherited (1)
-            if {$inherited_a != $inherited_b} {
-                return [expr {$inherited_a - $inherited_b}]
-            }
-
-            # Within same inheritance status, sort by email
-            lassign [extract_user_info $a] _ email_a
-            lassign [extract_user_info $b] _ email_b
-            return [string compare -nocase $email_a $email_b]
-        }}
-    } $permissions]
-
-    # The policy's view of this folder: entitlements, plus the same audit
-    # findings the CLI would report, merged into the table's State column
-    ::ui::update_governed onedrive $item_id
-    set model ""
-    if {[info exists ::ui::state(model)]} { set model $::ui::state(model) }
-    set violations [::ui::audit_one_folder onedrive $item_id]
-    set bound {}
-    if {$model ne "" && [dict exists $model plan onedrive $item_id]} {
-        set bound [dict get $model plan onedrive $item_id expected]
-    }
-    set governed [expr {$model ne "" && [dict exists $model plan onedrive $item_id]}]
-
-    # Populate treeview; the owner rows stay visible but carry no
-    # permission id, which is what keeps them out of removal
-    set seen_emails {}
-    foreach perm $sorted_permissions {
-        set roles [dict get $perm roles]
-        set is_owner [expr {[lsearch $roles "owner"] >= 0}]
-
-        set perm_id [expr {$is_owner ? "" : [dict get $perm id]}]
-
-        # Get user information; the policy's person name beats the drive's
-        # display name (accounts get relabeled by their users)
-        lassign [extract_user_info $perm] user_name user_email
-        set email_lower [string tolower $user_email]
-        dict set seen_emails $email_lower 1
-        if {$model ne ""} {
-            set slug [identity_person_for $model onedrive $email_lower]
-            if {$slug ne ""} { set user_name [identity_display $model $slug] }
-        }
-
-        # Drive-actual role, normalized like the audit sees it
-        if {$is_owner} {
-            set drive_role "owner"
-        } elseif {[lsearch $roles "write"] >= 0} {
-            set drive_role "write"
-        } else {
-            set drive_role "read"
-        }
-
-        # Policy-intended role
-        set policy_cell "\u2014"
-        if {[dict exists $bound $email_lower]} {
-            set policy_cell [dict get $bound $email_lower]
-        } elseif {$model ne "" && !$governed} {
-            set policy_cell "\u2014 not governed"
-        }
-
-        # Link column
-        set link_cell "-"
-        if {[dict exists $perm link]} {
-            set lt ""
-            set lsc ""
-            catch {set lt [dict get $perm link type]}
-            catch {set lsc [dict get $perm link scope]}
-            set link_cell [string trim "$lt/$lsc" /]
-        }
-
-        set is_inherited [is_inherited_permission $perm]
-        set inherited_str [expr {$is_inherited ? "Yes" : "No"}]
-
-        # State from the audit, person-blind rows kept honest
-        if {$is_owner} {
-            set state_cell "owner"
-            set state_tag {}
-        } elseif {!$governed} {
-            set state_cell [expr {$model eq "" ? "" : "not audited"}]
-            set state_tag {}
-        } else {
-            lassign [::ui::state_cell $violations $email_lower] state_cell state_tag
-        }
-
-        set tags [list]
-        if {$is_owner} {
-            lappend tags "owner"
-        } elseif {[lsearch $roles "read"] >= 0} {
-            lappend tags "read"
-        } else {
-            lappend tags "write"
-        }
-        if {$is_inherited} { lappend tags "inherited" }
-        if {$state_tag ne ""} { lappend tags $state_tag }
-
-        $acl_tree insert {} end -text $user_email \
-            -values [list $user_name $policy_cell $drive_role $inherited_str $link_cell $state_cell $perm_id] \
-            -tags $tags
-    }
-
-    # Entitled people the drive does not know yet: synthetic MISSING rows
-    dict for {email role} $bound {
-        if {[dict exists $seen_emails $email]} { continue }
-        set who ""
-        if {$model ne ""} {
-            set who [identity_display $model [identity_person_for $model onedrive $email]]
-        }
-        $acl_tree insert {} end -text $email \
-            -values [list $who $role "\u2014" "\u2014" "-" "\u274c MISSING \u2014 invite as $role" ""] \
-            -tags missing
-    }
-
-    # Enable invite button now that ACL is loaded
-    $::ui::w(btn_invite) configure -state normal
-
-    ::ui::status "✅ ACL listing of: https://onedrive.live.com/?id=$item_id" green
+    set ::ui::state(acl_snapshot) [dict create platform onedrive fid $item_id name $item_name \
+        read_at [clock seconds] permissions $permissions]
+    ::ui::access_render
+    ::ui::status "✅ [llength $permissions] permission(s) on $item_name (token: $capability)" green
 }
 
 
